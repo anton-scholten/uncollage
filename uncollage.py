@@ -17,11 +17,13 @@ Usage:
     hand-crafted cues. Train it once with `python seam_ai.py train`.
   * --split-lines (-l): also split a blob wherever a full-span STRAIGHT content
     boundary shows it is several butted-together photos with no gap between them
-    (e.g. touching postcards). OFF by default and opt-in on purpose: a photo's
-    own straight internal line -- a horizon, a building edge -- is
-    indistinguishable from a real print seam and gets split too, so this can
-    over-split ordinary landscapes. Use it only on scans you know are composites;
-    for anything ambiguous prefer the manual-boxes fallback below.
+    (e.g. the touching postcards in 69.jpg). A cut must be straight and leave two
+    pieces that each look like a real photo; a piece left too uniform (a sky/sea
+    slice) is discarded rather than saved, and a cut that would only peel such a
+    slice off is rejected -- so a photo's own straight horizon does not split it.
+    Still OFF by default: two textured halves of one photo split by a strong
+    straight internal edge could be over-split, so enable it on scans you know
+    are composites; for anything ambiguous prefer the manual-boxes fallback.
 
 Manual-boxes fallback (automatic):
   Some pages cannot be split automatically (e.g. faded, borderless photos on
@@ -114,6 +116,9 @@ LINE_MIN_PIECE = 0.15    # each resulting piece >= this fraction of the box exte
 LINE_MIN_FG = 0.50       # both sides of a cut must be at least this much foreground
 LINE_STRAIGHT_MAX = 6.0  # max px scatter of the edge along the line (real print
                          # edges are straight; ragged internal content is not)
+LINE_VAR_MIN = 20.0      # a real photo piece has at least this tonal std ...
+LINE_EDGE_MIN = 0.015    # ... and this edge density; below => a uniform region
+                         # (sky/sea) so the cut sliced one photo -> reject it
 LINE_MAX_DEPTH = 5       # max recursive line cuts per blob
 # ------------------------------------------------------------------------------
 
@@ -324,16 +329,31 @@ def _edge_straightness(gray, pos, axis, k=14):
     return float(np.std(peak))
 
 
+def _piece_uniform(gray_slice, edge_slice, mask_slice):
+    """True if the foreground of a piece is too plain to be a photo on its own
+    -- little tonal spread AND/OR almost no edges (sky, sea, a flat wall). Such a
+    piece means the cut sliced through a single photo rather than between two."""
+    m = mask_slice
+    if m.sum() < 1:
+        return True
+    return gray_slice[m].std() < LINE_VAR_MIN or edge_slice[m].mean() < LINE_EDGE_MIN
+
+
 def _best_line_cut(region, mask_region, min_area):
     """Best full-span straight boundary in a region, or None. Returns
     (orientation 'h' | 'v', position). A cut qualifies only when it (a) is a
     full-span content discontinuity (LINE_COV_THRESH), (b) is a straight line
     (LINE_STRAIGHT_MAX) -- which tells a real print edge from ragged internal
-    content of equal contrast -- and (c) leaves two large, mostly-foreground
-    pieces (so it separates two photos, not a photo from paper)."""
+    content of equal contrast -- (c) leaves two large, mostly-foreground pieces
+    (so it separates two photos, not a photo from paper), and (d) leaves two
+    pieces that each look like a real photo, not a uniform sky/sea slice. When
+    the top-coverage cut fails (d) the next-best qualifying cut is used, so a
+    photo's own straight horizon is skipped in favour of the real seam."""
     best, best_cov = None, LINE_COV_THRESH
     h, w = region.shape[:2]
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    edges = cv2.Canny(gray.astype(np.uint8), 40, 120) > 0
+    mb = mask_region > 0
     for axis, orient, extent, other in ((0, "h", h, w), (1, "v", w, h)):
         cov = _disc_coverage(region, axis)
         lo, hi = int(LINE_MARGIN * extent), extent - int(LINE_MARGIN * extent)
@@ -343,15 +363,38 @@ def _best_line_cut(region, mask_region, min_area):
             if min(p, extent - p) * other < min_area:
                 continue
             if orient == "h":
-                f1, f2 = (mask_region[:p] > 0).mean(), (mask_region[p:] > 0).mean()
+                f1, f2 = mb[:p].mean(), mb[p:].mean()
             else:
-                f1, f2 = (mask_region[:, :p] > 0).mean(), (mask_region[:, p:] > 0).mean()
+                f1, f2 = mb[:, :p].mean(), mb[:, p:].mean()
             if min(f1, f2) < LINE_MIN_FG:
                 continue
             if _edge_straightness(gray, p, axis) > LINE_STRAIGHT_MAX:
                 continue
+            if orient == "h":
+                u1 = _piece_uniform(gray[:p], edges[:p], mb[:p])
+                u2 = _piece_uniform(gray[p:], edges[p:], mb[p:])
+            else:
+                u1 = _piece_uniform(gray[:, :p], edges[:, :p], mb[:, :p])
+                u2 = _piece_uniform(gray[:, p:], edges[:, p:], mb[:, p:])
+            if u1 or u2:
+                continue
             best_cov, best = cov[p], (orient, p)
     return best
+
+
+def _blob_uniform(img, blob):
+    """True if a blob's foreground is too plain to be a photo -- little tonal
+    spread or almost no edges. Used to discard sky/sea slivers that a cut can
+    leave as their own connected component (e.g. 69.jpg's dune sea-strip)."""
+    ys, xs = np.where(blob > 0)
+    if len(xs) == 0:
+        return True
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+    g = cv2.cvtColor(img[y0:y1 + 1, x0:x1 + 1], cv2.COLOR_BGR2GRAY)
+    m = blob[y0:y1 + 1, x0:x1 + 1] > 0
+    if g[m].std() < LINE_VAR_MIN:
+        return True
+    return (cv2.Canny(g, 40, 120) > 0)[m].mean() < LINE_EDGE_MIN
 
 
 def _split_blob_by_lines(img, blob, min_area, depth=0):
@@ -359,7 +402,9 @@ def _split_blob_by_lines(img, blob, min_area, depth=0):
     boundary shows it actually holds several butted-together photos (e.g. the
     touching postcards in 69.jpg). The blob mask is cut along the line and
     re-labelled with connected components, so each photo comes out as its own
-    tightly-bounded blob (no paper corners, no reliance on a gap/seam)."""
+    tightly-bounded blob (no paper corners, no reliance on a gap/seam). Pieces
+    left too uniform by a cut (a detached sky/sea slice) are discarded rather
+    than saved as spurious sub-images."""
     if depth >= LINE_MAX_DEPTH:
         return [blob]
     ys, xs = np.where(blob > 0)
@@ -378,12 +423,13 @@ def _split_blob_by_lines(img, blob, min_area, depth=0):
     else:
         cv2.line(trial, (x0 + p, y0), (x0 + p, y1), 0, thick)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(trial)
-    pieces = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+    pieces = [(labels == i).astype(np.uint8) * 255
+              for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+    pieces = [pb for pb in pieces if not _blob_uniform(img, pb)]
     if len(pieces) < 2:
-        return [blob]                       # cut did not actually separate two
-    return [out for i in pieces
-            for out in _split_blob_by_lines(img, (labels == i).astype(np.uint8) * 255,
-                                            min_area, depth + 1)]
+        return [blob]                       # cut did not separate two real photos
+    return [out for pb in pieces
+            for out in _split_blob_by_lines(img, pb, min_area, depth + 1)]
 
 
 def find_subimages(img, rectangular=False, ai=False, split_lines=False):
