@@ -2,4 +2,4 @@
 #   'PATH'              -> still needs boxes
 #   'PATH x y w h ...'  -> these boxes are used
 # Draw the pending ones with: python draw_boxes.py manual_boxes.txt
-/home/anton/Downloads/Github_codes/uncollage/63.jpg 1169 0 529 695 128 223 878 674 1131 606 567 801 168 929 876 680 1105 1388 593 880 164 1634 976 701
+/home/anton/Downloads/Github_codes/uncollage/63.jpg 1167 0 497 687 121 234 882 665 1135 621 563 782 159 937 893 667 1099 1388 599 865 170 1628 973 708

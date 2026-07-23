@@ -18,11 +18,15 @@ Usage:
   already have boxes). Then re-run your uncollage.py command to use them.
 
 Controls (in the window):
-    drag on empty space    draw a new box around a photo
-    drag a corner handle   resize an existing box
-    drag inside a box      move it
+    drag inside / empty    draw a new box (may overlap existing boxes)
+    drag a corner handle   resize the box under the cursor
+    drag a box's edge      move that box
     toolbar buttons        Undo / Clear / Save / Cancel  (hover for a tooltip)
     keys                   u=undo  r=clear  s/Enter=save  q/Esc=cancel
+
+Overlapping boxes are supported: because only a box's edge (or corner) grabs it,
+a drag that starts inside a box makes a new box instead of moving the old one,
+so overlapping sub-images can each get their own box.
 
 Boxes are written one "x y w h" per line in SOURCE-image pixels. With --run,
 sam_uncollage.py is invoked on the image with the saved boxes afterwards.
@@ -78,6 +82,19 @@ def _hit_corner(boxes, mx, my, r=_GRAB):
     return None
 
 
+def _hit_edge(boxes, mx, my, r=_GRAB):
+    """Topmost box whose border (edge, not interior) is within r px of the
+    cursor, or None. Only the border grabs a box; the interior stays free so a
+    drag there starts a NEW box -- letting the user draw overlapping boxes."""
+    for i in range(len(boxes) - 1, -1, -1):
+        x0, y0, x1, y1 = _norm(boxes[i])
+        on_vert = (abs(mx - x0) <= r or abs(mx - x1) <= r) and y0 - r <= my <= y1 + r
+        on_horz = (abs(my - y0) <= r or abs(my - y1) <= r) and x0 - r <= mx <= x1 + r
+        if on_vert or on_horz:
+            return i
+    return None
+
+
 def _layout_buttons():
     buttons = []
     bx, by, bh = 8, 8, 30
@@ -112,9 +129,11 @@ def draw(image_path):
     """Open a window to draw/edit one box per photo. Returns [(x,y,w,h), ...] in
     source pixels on save, or None if cancelled.
 
-    Drag on empty space to add a box; drag a corner handle to resize an existing
-    box; drag inside a box to move it. The toolbar buttons (Undo / Clear / Save /
-    Cancel) show a tooltip on hover; the same actions are on u / r / Enter / Esc.
+    Drag to add a box; drag a corner handle to resize; drag a box's EDGE to move
+    it. Only the edge/corner grabs a box, so a drag starting inside a box makes a
+    new (possibly overlapping) box -- letting overlapping sub-images each get one.
+    The toolbar buttons (Undo / Clear / Save / Cancel) show a tooltip on hover;
+    the same actions are on u / r / Enter / Esc.
     """
     img = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
@@ -174,12 +193,12 @@ def draw(image_path):
             if hc is not None:
                 state.update(mode="resize", idx=hc[0], corner=hc[1])
                 return
-            for i in range(len(boxes) - 1, -1, -1):
-                x0, y0, x1, y1 = _norm(boxes[i])
-                if x0 <= mx <= x1 and y0 <= my <= y1:
-                    state.update(mode="move", idx=i, off=(mx - x0, my - y0))
-                    return
-            boxes.append([mx, my, mx, my])
+            he = _hit_edge(boxes, mx, my)          # only the border grabs a box
+            if he is not None:
+                x0, y0, _, _ = _norm(boxes[he])
+                state.update(mode="move", idx=he, off=(mx - x0, my - y0))
+                return
+            boxes.append([mx, my, mx, my])         # interior/empty -> new box
             state.update(mode="new", idx=len(boxes) - 1)
         elif event == cv2.EVENT_MOUSEMOVE:
             if state["mode"] == "new":
