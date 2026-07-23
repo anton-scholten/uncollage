@@ -15,6 +15,13 @@ Usage:
   * --ai (-a): like --rectangular, but the seams are found by a small offline
     neural net (seam_ai.py, weights in seam_model.npz) instead of only the
     hand-crafted cues. Train it once with `python seam_ai.py train`.
+  * --split-lines (-l): also split a blob wherever a full-span STRAIGHT content
+    boundary shows it is several butted-together photos with no gap between them
+    (e.g. touching postcards). OFF by default and opt-in on purpose: a photo's
+    own straight internal line -- a horizon, a building edge -- is
+    indistinguishable from a real print seam and gets split too, so this can
+    over-split ordinary landscapes. Use it only on scans you know are composites;
+    for anything ambiguous prefer the manual-boxes fallback below.
 
 Manual-boxes fallback (automatic):
   Some pages cannot be split automatically (e.g. faded, borderless photos on
@@ -99,6 +106,15 @@ MANUAL_FILE_DEFAULT = "manual_boxes.txt"  # where failed pages are listed
 MANUAL_SPAN = 0.80          # a box spanning >= this of BOTH page dims => failed
 MANUAL_DOMINANT_AREA = 0.55 # a blob >= this fraction of the page ...
 MANUAL_DOMINANT_RATIO = 3.0 # ... and >= this x the next largest => it merged some
+# --- Straight-line composition split ------------------------------------------
+LINE_COV_THRESH = 0.80   # a full-span content boundary crosses >= this of the box
+LINE_JUMP = 30.0         # per-column colour distance counted as an edge crossing
+LINE_MARGIN = 0.10       # never cut within this fraction of a box edge
+LINE_MIN_PIECE = 0.15    # each resulting piece >= this fraction of the box extent
+LINE_MIN_FG = 0.50       # both sides of a cut must be at least this much foreground
+LINE_STRAIGHT_MAX = 6.0  # max px scatter of the edge along the line (real print
+                         # edges are straight; ragged internal content is not)
+LINE_MAX_DEPTH = 5       # max recursive line cuts per blob
 # ------------------------------------------------------------------------------
 
 
@@ -272,7 +288,105 @@ def _ai_seam_maps(img):
     return (prob_h > AI_PROB_THRESH) | base_h, (prob_v > AI_PROB_THRESH) | base_v
 
 
-def find_subimages(img, rectangular=False, ai=False):
+def _disc_coverage(region, axis):
+    """For every line across `region` perpendicular to `axis`, the fraction of
+    the span whose colour changes sharply from just-before to just-after -- i.e.
+    how fully a straight content boundary crosses the region at that position.
+    A boundary between two butted-together photos runs edge to edge, so it scores
+    near 1, while most content inside a single photo does not.
+    axis=0 scans rows (candidate horizontal boundary); axis=1 scans columns."""
+    reg = region.astype(np.float32)
+    if axis == 1:
+        reg = np.transpose(reg, (1, 0, 2))
+    n, m = reg.shape[0], reg.shape[1]
+    k = max(8, int(0.015 * n))
+    cs = np.cumsum(np.vstack([np.zeros((1, m, 3), np.float32), reg]), axis=0)
+    band = lambda a, b: (cs[b] - cs[a]) / max(1, b - a)
+    cov = np.zeros(n, np.float32)
+    for r in range(k + 2, n - k - 2):
+        d = np.sqrt(((band(r - k, r - 2) - band(r + 2, r + k)) ** 2).sum(1))
+        cov[r] = (d > LINE_JUMP).mean()
+    return cov
+
+
+def _edge_straightness(gray, pos, axis, k=14):
+    """Scatter (std, in px) of where the strongest edge actually falls along a
+    candidate cut line. A real print edge is a straight line -> small scatter;
+    ragged internal content (foliage meeting a building) -> large scatter."""
+    n = gray.shape[axis]
+    a, b = max(0, pos - k), min(n, pos + k)
+    if axis == 0:
+        band = gray[a:b, :]
+        peak = np.abs(cv2.Sobel(band, cv2.CV_32F, 0, 1, ksize=3)).argmax(0)
+    else:
+        band = gray[:, a:b]
+        peak = np.abs(cv2.Sobel(band, cv2.CV_32F, 1, 0, ksize=3)).argmax(1)
+    return float(np.std(peak))
+
+
+def _best_line_cut(region, mask_region, min_area):
+    """Best full-span straight boundary in a region, or None. Returns
+    (orientation 'h' | 'v', position). A cut qualifies only when it (a) is a
+    full-span content discontinuity (LINE_COV_THRESH), (b) is a straight line
+    (LINE_STRAIGHT_MAX) -- which tells a real print edge from ragged internal
+    content of equal contrast -- and (c) leaves two large, mostly-foreground
+    pieces (so it separates two photos, not a photo from paper)."""
+    best, best_cov = None, LINE_COV_THRESH
+    h, w = region.shape[:2]
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    for axis, orient, extent, other in ((0, "h", h, w), (1, "v", w, h)):
+        cov = _disc_coverage(region, axis)
+        lo, hi = int(LINE_MARGIN * extent), extent - int(LINE_MARGIN * extent)
+        for p in range(lo, hi):
+            if cov[p] <= best_cov or min(p, extent - p) < LINE_MIN_PIECE * extent:
+                continue
+            if min(p, extent - p) * other < min_area:
+                continue
+            if orient == "h":
+                f1, f2 = (mask_region[:p] > 0).mean(), (mask_region[p:] > 0).mean()
+            else:
+                f1, f2 = (mask_region[:, :p] > 0).mean(), (mask_region[:, p:] > 0).mean()
+            if min(f1, f2) < LINE_MIN_FG:
+                continue
+            if _edge_straightness(gray, p, axis) > LINE_STRAIGHT_MAX:
+                continue
+            best_cov, best = cov[p], (orient, p)
+    return best
+
+
+def _split_blob_by_lines(img, blob, min_area, depth=0):
+    """Recursively split a foreground blob wherever a full-span straight content
+    boundary shows it actually holds several butted-together photos (e.g. the
+    touching postcards in 69.jpg). The blob mask is cut along the line and
+    re-labelled with connected components, so each photo comes out as its own
+    tightly-bounded blob (no paper corners, no reliance on a gap/seam)."""
+    if depth >= LINE_MAX_DEPTH:
+        return [blob]
+    ys, xs = np.where(blob > 0)
+    if len(xs) == 0:
+        return []
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+    cut = _best_line_cut(img[y0:y1 + 1, x0:x1 + 1],
+                         blob[y0:y1 + 1, x0:x1 + 1], min_area)
+    if cut is None:
+        return [blob]
+    orient, p = cut
+    trial = blob.copy()
+    thick = max(2, int(round(0.004 * min(x1 - x0 + 1, y1 - y0 + 1))))
+    if orient == "h":
+        cv2.line(trial, (x0, y0 + p), (x1, y0 + p), 0, thick)
+    else:
+        cv2.line(trial, (x0 + p, y0), (x0 + p, y1), 0, thick)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(trial)
+    pieces = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+    if len(pieces) < 2:
+        return [blob]                       # cut did not actually separate two
+    return [out for i in pieces
+            for out in _split_blob_by_lines(img, (labels == i).astype(np.uint8) * 255,
+                                            min_area, depth + 1)]
+
+
+def find_subimages(img, rectangular=False, ai=False, split_lines=False):
     """Return a list of (x, y, w, h) upright crop boxes, one per sub-image.
 
     When rectangular is True, each foreground blob is additionally split along
@@ -294,6 +408,15 @@ def find_subimages(img, rectangular=False, ai=False):
         blobs = [piece
                  for blob in blobs
                  for piece in _split_rectangular(blob, seam_h, seam_v, min_area, seam_thresh)]
+
+    # Opt-in: split any blob that a full-span STRAIGHT boundary shows is really
+    # several butted-together photos (e.g. touching postcards with no gap). Off
+    # by default because a photo's own straight internal line -- a horizon, a
+    # building edge -- is indistinguishable from a real print seam and would be
+    # split too (see 69.jpg's dune sea-line). Use only on known composite scans.
+    if split_lines:
+        blobs = [piece for blob in blobs
+                 for piece in _split_blob_by_lines(img, blob, min_area)]
 
     boxes = [box for box in (_blob_to_box(b) for b in blobs) if box is not None]
     return _order_boxes(boxes, h)
@@ -339,7 +462,7 @@ def _write_crops(path, img, boxes):
     return count
 
 
-def process_image(path, rectangular=False, ai=False, manual=None):
+def process_image(path, rectangular=False, ai=False, split_lines=False, manual=None):
     """Extract sub-images from one image file. Returns the number written.
 
     When `manual` (a context from _load_manual) is given:
@@ -361,7 +484,7 @@ def process_image(path, rectangular=False, ai=False, manual=None):
         print(f"  using {len(boxes)} manual box(es) from {os.path.basename(manual['path'])}")
         return _write_crops(path, img, boxes)
 
-    boxes = find_subimages(img, rectangular=rectangular, ai=ai)
+    boxes = find_subimages(img, rectangular=rectangular, ai=ai, split_lines=split_lines)
 
     if manual is not None and _needs_manual(img, boxes):
         manual["entries"].setdefault(ap, None)
@@ -468,6 +591,11 @@ def main(argv):
         if flag in args:
             ai = True
             args = [a for a in args if a != flag]
+    split_lines = False
+    for flag in ("--split-lines", "-l"):
+        if flag in args:
+            split_lines = True
+            args = [a for a in args if a != flag]
 
     manual_path = MANUAL_FILE_DEFAULT
     if "--manual" in args:
@@ -499,7 +627,8 @@ def main(argv):
     total = 0
     for img_path in iter_input_paths(in_path):
         print(f"processing {img_path}")
-        total += process_image(img_path, rectangular=rectangular, ai=ai, manual=manual)
+        total += process_image(img_path, rectangular=rectangular, ai=ai,
+                               split_lines=split_lines, manual=manual)
 
     # Pass 2: draw boxes for the queued failures, then crop them.
     queued = list(manual["pending"])

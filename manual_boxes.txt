@@ -1,5 +1,0 @@
-# Manual boxes for pages uncollage.py could not split.
-#   'PATH'              -> still needs boxes
-#   'PATH x y w h ...'  -> these boxes are used
-# Draw the pending ones with: python draw_boxes.py manual_boxes.txt
-/home/anton/Downloads/Github_codes/uncollage/63.jpg 1167 0 497 687 121 234 882 665 1135 621 563 782 159 937 893 667 1099 1388 599 865 170 1628 973 708
