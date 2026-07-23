@@ -1,3 +1,4 @@
 *.jpg
 manual_boxes.txt
 images_to_process.txt
+__pycache__/
