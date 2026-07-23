@@ -609,11 +609,11 @@ def _has_display():
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _draw_and_crop(path, manual, draw_mod, out_dir=None):
+def _draw_and_crop(path, manual, draw_mod, out_dir=None, index=None, total=None):
     """Open the box editor for one queued image and crop from what is drawn."""
     print(f"\n  draw boxes for {path}  "
           "(drag one box per photo; s/Enter=save, q/Esc=skip)")
-    boxes = draw_mod.draw(path)
+    boxes = draw_mod.draw(path, index, total)
     if not boxes:
         print("  [manual] skipped -- still needs boxes")
         return 0
@@ -730,8 +730,10 @@ def main(argv):
         if draw_boxes is not None:
             print(f"\n{len(queued)} page(s) need manual boxes -- opening the box "
                   "editor for each...")
-            for img_path in queued:
-                total += _draw_and_crop(img_path, manual, draw_boxes, out_dir)
+            nq = len(queued)
+            for k, img_path in enumerate(queued, 1):
+                total += _draw_and_crop(img_path, manual, draw_boxes, out_dir, k, nq)
+                _save_manual(manual)    # persist after each crop, in case of a crash
 
     _save_manual(manual)
 

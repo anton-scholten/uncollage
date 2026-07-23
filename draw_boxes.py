@@ -17,6 +17,10 @@ Usage:
   draw are written back onto its line (add --redo to also redraw lines that
   already have boxes). Then re-run your uncollage.py command to use them.
 
+The window is resizable -- drag its border to enlarge it and zoom into the
+image. In list mode the title shows progress as "current/total - name.ext", and
+the file is rewritten after every image so a crash never loses drawn boxes.
+
 Controls (in the window):
     drag inside / empty    draw a new box (may overlap existing boxes)
     drag a corner handle   resize the box under the cursor
@@ -46,7 +50,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 import cv2
 import numpy as np
 
-MAX_VIEW = 1100          # window is scaled so its long side is at most this
+MAX_VIEW = 1400          # working buffer long side (the window is resizable, so a
+                         # larger buffer means more detail when zoomed in)
+INIT_VIEW = 950          # initial on-screen window long side (fits a laptop screen)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 _GRAB = 10               # how close (px) the cursor must be to grab a corner
@@ -125,9 +131,11 @@ def _tooltip(vis, text, mx, my):
     cv2.putText(vis, text, (x + pad, y + pad + th), _FONT, 0.5, (255, 255, 255), 1)
 
 
-def draw(image_path):
+def draw(image_path, index=None, total=None):
     """Open a window to draw/edit one box per photo. Returns [(x,y,w,h), ...] in
-    source pixels on save, or None if cancelled.
+    source pixels on save, or None if cancelled. The window is resizable -- drag
+    its border to enlarge it and zoom into the image. When `index`/`total` are
+    given the title is "index/total - name.ext".
 
     Drag to add a box; drag a corner handle to resize; drag a box's EDGE to move
     it. Only the edge/corner grabs a box, so a drag starting inside a box makes a
@@ -226,8 +234,13 @@ def draw(image_path):
                     boxes.pop(i)
             state.update(mode=None, idx=-1, corner=-1, btn=None)
 
-    win = "draw boxes -- " + os.path.basename(image_path)
-    cv2.namedWindow(win)
+    name = os.path.basename(image_path)
+    win = f"{index}/{total} - {name}" if index and total else "draw boxes -- " + name
+    # Resizable window (drag border to enlarge/zoom); mouse coords stay in image
+    # pixels. Open at a screen-friendly size while keeping the buffer's detail.
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    s0 = min(1.0, INIT_VIEW / max(vw, vh))
+    cv2.resizeWindow(win, max(1, int(vw * s0)), max(1, int(vh * s0)))
     cv2.setMouseCallback(win, on_mouse)
     saved = False
     while True:
@@ -283,40 +296,42 @@ def run_manual_file(list_path, redo=False):
         has = len(nums) >= 4 and len(nums) % 4 == 0
         parsed.append(("img", parts[0], nums if has else []))
 
-    results = {}
-    needed = False
-    for item in parsed:
-        if item[0] != "img":
-            continue
-        name, existing = item[1], item[2]
-        if existing and not redo:
-            continue
-        needed = True
-        ip = name if (os.path.isabs(name) or os.path.exists(name)) \
-            else os.path.join(base, name)
-        print(f"drawing boxes for {ip}  (drag one box per photo; "
-              "s/Enter=save, q/Esc=skip)")
-        boxes = draw(ip)
-        if boxes:
-            results[name] = boxes
-    if not needed:
+    todo = [item[1] for item in parsed
+            if item[0] == "img" and (redo or not item[2])]
+    if not todo:
         print("all listed images already have boxes (use --redo to redraw).")
         return 0
 
-    with open(list_path, "w", encoding="utf-8") as f:
-        for item in parsed:
-            if item[0] == "raw":
-                f.write(item[1] + "\n")
-                continue
-            name, existing = item[1], item[2]
-            boxes = results.get(name)
-            if boxes is not None:
-                flat = " ".join(f"{x} {y} {w} {h}" for x, y, w, h in boxes)
-                f.write(f"{name} {flat}\n")
-            elif existing:
-                f.write(name + " " + " ".join(existing) + "\n")
-            else:
-                f.write(name + "\n")          # skipped -> stays pending
+    results = {}
+
+    def flush():
+        """Rewrite the whole list file from parsed + results (called after every
+        image so a crash never loses boxes already drawn)."""
+        with open(list_path, "w", encoding="utf-8") as f:
+            for item in parsed:
+                if item[0] == "raw":
+                    f.write(item[1] + "\n")
+                    continue
+                name, existing = item[1], item[2]
+                boxes = results.get(name)
+                if boxes is not None:
+                    flat = " ".join(f"{x} {y} {w} {h}" for x, y, w, h in boxes)
+                    f.write(f"{name} {flat}\n")
+                elif existing:
+                    f.write(name + " " + " ".join(existing) + "\n")
+                else:
+                    f.write(name + "\n")      # skipped -> stays pending
+
+    total = len(todo)
+    for k, name in enumerate(todo, 1):
+        ip = name if (os.path.isabs(name) or os.path.exists(name)) \
+            else os.path.join(base, name)
+        print(f"[{k}/{total}] drawing boxes for {ip}  (drag one box per photo; "
+              "s/Enter=save, q/Esc=skip)")
+        boxes = draw(ip, k, total)
+        if boxes:
+            results[name] = boxes
+        flush()                               # persist after each image
     print(f"updated {list_path}: drew boxes for {len(results)} image(s). "
           "Re-run your uncollage.py command to use them.")
     return 0

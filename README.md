@@ -59,9 +59,10 @@ in one run:
 1. **Pass 1** processes every input; clean pages are cropped, and any page whose
    automatic split looks merged/failed is queued.
 2. **Pass 2** opens the box editor (`draw_boxes.py`) for each queued page in
-   turn — you drag one box per photo — and its sub-images are cropped
-   immediately. The boxes are cached in the manual file, so a later run reuses
-   them without asking again.
+   turn — the title shows `current/total - name.ext` — you drag one box per
+   photo, and its sub-images are cropped immediately. The boxes are cached in the
+   manual file, saved **after each page** (so a crash never loses completed
+   work), and a later run reuses them without asking again.
 
 With `--no-draw` (or a headless machine with no display), Pass 2 is skipped; the
 queued pages are listed in the manual file, and you can draw them later:
@@ -110,6 +111,11 @@ python draw_boxes.py manual_boxes.txt [--redo]      # fill uncollage.py's list
 
 Because only a box's edge or corner grabs it, a drag starting inside a box makes
 a **new** box — so overlapping sub-images can each get their own box.
+
+The window is **resizable** — drag its border to enlarge it and zoom into the
+image. When processing a queue (the fallback or list mode) the title shows
+progress as `current/total - name.ext`, and the boxes file is rewritten **after
+every image**, so a crash never loses work already done.
 
 ---
 
