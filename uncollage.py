@@ -16,18 +16,19 @@ Usage:
     neural net (seam_ai.py, weights in seam_model.npz) instead of only the
     hand-crafted cues. Train it once with `python seam_ai.py train`.
 
-Manual-boxes fallback:
+Manual-boxes fallback (automatic):
   Some pages cannot be split automatically (e.g. faded, borderless photos on
-  shadowed paper, whose edges are not visible in the scan). When a page's
-  automatic split looks merged/failed, the page is NOT cropped; instead its path
-  is appended to a manual-boxes file (default manual_boxes.txt, override with
-  --manual FILE). Draw one rough box per photo with
+  shadowed paper, whose edges are not visible in the scan). Every input image is
+  processed first; any page whose automatic split looks merged/failed is queued.
+  After the batch, uncollage opens a box editor (draw_boxes.py) for each queued
+  page in turn -- drag one rough box per photo (s/Enter to save, q/Esc to skip)
+  -- and its sub-images are cropped immediately from the boxes you draw. The
+  boxes are cached in a manual-boxes file (default manual_boxes.txt, override
+  with --manual FILE) so a later run reuses them without asking again.
 
-      python draw_boxes.py manual_boxes.txt
-
-  which writes the coordinates back onto each line, then re-run the SAME
-  uncollage.py command: lines that now carry coordinates are detected and those
-  boxes are used verbatim instead of automatic detection.
+  --no-draw (or a headless session with no display) skips the editor and just
+  lists the queued pages in the manual-boxes file; draw them later with
+  `python draw_boxes.py manual_boxes.txt` and re-run.
 
 Output sub-images are written next to each source image, named
     <stem>_1.<ext>, <stem>_2.<ext>, ...
@@ -342,11 +343,11 @@ def process_image(path, rectangular=False, ai=False, manual=None):
     """Extract sub-images from one image file. Returns the number written.
 
     When `manual` (a context from _load_manual) is given:
-      * if the file already carries hand-drawn boxes for this image, they are
-        used directly and the automatic detector is bypassed;
+      * if the cache already holds hand-drawn boxes for this image, they are used
+        directly and the automatic detector is bypassed;
       * otherwise the detector runs, and if its result looks merged/failed the
-        image is flagged for manual boxing (appended to the manual file) and no
-        crops are written this run.
+        image is queued (no crops written yet); main() draws boxes for the whole
+        queue after the batch.
     """
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
@@ -354,18 +355,19 @@ def process_image(path, rectangular=False, ai=False, manual=None):
         return 0
 
     ap = os.path.abspath(path)
-    if manual is not None and ap in manual["coords"]:
-        boxes = _order_boxes(list(manual["coords"][ap]), img.shape[0])
+    cached = manual["entries"].get(ap) if manual is not None else None
+    if cached:
+        boxes = _order_boxes(list(cached), img.shape[0])
         print(f"  using {len(boxes)} manual box(es) from {os.path.basename(manual['path'])}")
         return _write_crops(path, img, boxes)
 
     boxes = find_subimages(img, rectangular=rectangular, ai=ai)
 
     if manual is not None and _needs_manual(img, boxes):
-        if ap not in manual["listed"]:
-            manual["pending"].append(ap)
-            manual["listed"].add(ap)
-        print("  [manual] automatic split looks merged/failed -- flagged for manual boxes")
+        manual["entries"].setdefault(ap, None)
+        if path not in manual["pending"]:
+            manual["pending"].append(path)
+        print("  [manual] automatic split looks merged/failed -- queued for boxing")
         return 0
 
     count = _write_crops(path, img, boxes)
@@ -375,14 +377,14 @@ def process_image(path, rectangular=False, ai=False, manual=None):
 
 
 def _load_manual(manual_path):
-    """Read the manual-boxes file into a context dict:
-       coords  -- {abs image path: [(x, y, w, h), ...]} for lines that have boxes,
-       listed  -- set of abs image paths already present in the file,
-       pending -- images flagged this run (appended by _flush_manual),
+    """Read the manual-boxes cache into a context dict:
+       entries -- {abs image path: [(x, y, w, h), ...] or None}, order preserved;
+                  a list means "use these boxes", None means "still needs boxes",
+       pending -- images queued for drawing this run (as given on the command),
        path    -- the file's path.
-    A line is "IMAGE" (pending, no boxes yet) or "IMAGE x y w h [x y w h ...]".
+    A line is "IMAGE" (needs boxes) or "IMAGE x y w h [x y w h ...]".
     """
-    ctx = {"coords": {}, "listed": set(), "pending": [], "path": manual_path}
+    ctx = {"entries": {}, "pending": [], "path": manual_path}
     if manual_path and os.path.exists(manual_path):
         with open(manual_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -391,29 +393,53 @@ def _load_manual(manual_path):
                     continue
                 parts = line.split()
                 ap = os.path.abspath(parts[0])
-                ctx["listed"].add(ap)
                 nums = parts[1:]
                 if len(nums) >= 4 and len(nums) % 4 == 0:
-                    ctx["coords"][ap] = [
+                    ctx["entries"][ap] = [
                         tuple(int(round(float(v))) for v in nums[i:i + 4])
                         for i in range(0, len(nums), 4)]
+                else:
+                    ctx["entries"].setdefault(ap, None)
     return ctx
 
 
-def _flush_manual(ctx):
-    """Append newly flagged images to the manual file. Returns how many added."""
-    if not ctx["pending"]:
+def _save_manual(ctx):
+    """Rewrite the manual-boxes cache from ctx['entries']. Returns entry count."""
+    entries = ctx["entries"]
+    if not entries:
         return 0
-    fresh = not os.path.exists(ctx["path"])
-    with open(ctx["path"], "a", encoding="utf-8") as f:
-        if fresh:
-            f.write("# Images that need manual boxes.\n")
-            f.write(f"#   1) python draw_boxes.py {os.path.basename(ctx['path'])}"
-                    "   (draw one box per photo)\n")
-            f.write("#   2) re-run the same uncollage.py command; the boxes are used.\n")
-        for ap in ctx["pending"]:
-            f.write(ap + "\n")
-    return len(ctx["pending"])
+    with open(ctx["path"], "w", encoding="utf-8") as f:
+        f.write("# Manual boxes for pages uncollage.py could not split.\n")
+        f.write("#   'PATH'              -> still needs boxes\n")
+        f.write("#   'PATH x y w h ...'  -> these boxes are used\n")
+        f.write(f"# Draw the pending ones with: python draw_boxes.py "
+                f"{os.path.basename(ctx['path'])}\n")
+        for ap, boxes in entries.items():
+            if boxes:
+                flat = " ".join(f"{x} {y} {w} {h}" for x, y, w, h in boxes)
+                f.write(f"{ap} {flat}\n")
+            else:
+                f.write(ap + "\n")
+    return len(entries)
+
+
+def _has_display():
+    """True when a GUI window can plausibly be opened (X11 or Wayland present)."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _draw_and_crop(path, manual, draw_mod):
+    """Open the box editor for one queued image and crop from what is drawn."""
+    print(f"\n  draw boxes for {path}  "
+          "(drag one box per photo; s/Enter=save, q/Esc=skip)")
+    boxes = draw_mod.draw(path)
+    if not boxes:
+        print("  [manual] skipped -- still needs boxes")
+        return 0
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    boxes = _order_boxes(list(boxes), img.shape[0])
+    manual["entries"][os.path.abspath(path)] = boxes
+    return _write_crops(path, img, boxes)
 
 
 def iter_input_paths(path):
@@ -448,6 +474,8 @@ def main(argv):
         i = args.index("--manual")
         manual_path = args[i + 1]
         del args[i:i + 2]
+    no_draw = "--no-draw" in args
+    args = [a for a in args if a != "--no-draw"]
 
     if len(args) != 1:
         print(__doc__)
@@ -466,16 +494,40 @@ def main(argv):
             return 1
 
     manual = _load_manual(manual_path)
+
+    # Pass 1: process every image; failures are queued in manual["pending"].
     total = 0
     for img_path in iter_input_paths(in_path):
         print(f"processing {img_path}")
         total += process_image(img_path, rectangular=rectangular, ai=ai, manual=manual)
-    flagged = _flush_manual(manual)
-    print(f"done: {total} sub-image(s) written")
-    if flagged:
-        print(f"\n{flagged} image(s) need manual boxes -> listed in {manual_path}\n"
-              f"  next: python draw_boxes.py {manual_path}\n"
-              f"  then re-run this command to use the boxes.")
+
+    # Pass 2: draw boxes for the queued failures, then crop them.
+    queued = list(manual["pending"])
+    if queued and not no_draw and _has_display():
+        try:
+            import draw_boxes
+        except Exception as exc:                       # pragma: no cover
+            draw_boxes = None
+            print(f"  [manual] could not open the box editor ({exc}); "
+                  "falling back to the manual file.")
+        if draw_boxes is not None:
+            print(f"\n{len(queued)} page(s) need manual boxes -- opening the box "
+                  "editor for each...")
+            for img_path in queued:
+                total += _draw_and_crop(img_path, manual, draw_boxes)
+
+    _save_manual(manual)
+
+    # Anything still without boxes (skipped in the editor, --no-draw, or headless).
+    pending_left = [ap for ap, b in manual["entries"].items() if not b]
+    print(f"\ndone: {total} sub-image(s) written")
+    if pending_left and (no_draw or not _has_display()):
+        print(f"{len(pending_left)} page(s) still need manual boxes -> {manual_path}\n"
+              f"  draw them: python draw_boxes.py {manual_path}\n"
+              f"  then re-run this command to crop them.")
+    elif pending_left:
+        print(f"{len(pending_left)} page(s) were skipped and still need boxes "
+              f"(listed in {manual_path}).")
     return 0
 
 
