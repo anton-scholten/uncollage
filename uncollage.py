@@ -3,9 +3,15 @@
 uncollage.py -- Separate an image collage / scanned page into individual sub-images.
 
 Usage:
-    python uncollage.py [--rectangular] PATH
+    python uncollage.py [options] PATH
 
+  * --out DIR (-o DIR): write every crop into DIR (created if needed), keeping
+    each source's base name; without it crops go next to their source image.
   * If PATH is an image file, its sub-images are extracted.
+  * If PATH is a folder, every image in it is processed (non-recursive). Files
+    that look like sub-images this tool already wrote (<stem>_<n> whose parent
+    <stem> image is also in the folder) are skipped, so re-running a folder does
+    not re-crop its own outputs.
   * If PATH is a text file, every line is treated as an image path and all of
     them are processed in batch. Blank lines and lines starting with '#' are
     ignored. Relative paths are resolved against the text file's own folder.
@@ -82,6 +88,7 @@ Requires: opencv-python (cv2), numpy.
 """
 
 import os
+import re
 import sys
 
 import cv2
@@ -492,11 +499,14 @@ def _needs_manual(img, boxes):
     return False
 
 
-def _write_crops(path, img, boxes):
-    """Write each box as <stem>_<n>.<ext>. Returns the number written."""
+def _write_crops(path, img, boxes, out_dir=None):
+    """Write each box as <stem>_<n>.<ext>. With out_dir, crops go there (keeping
+    the source's base name); otherwise next to the source. Returns the count."""
     stem, ext = os.path.splitext(path)
     if ext.lower() not in IMAGE_EXTS:
         ext = ".png"
+    if out_dir:
+        stem = os.path.join(out_dir, os.path.basename(stem))
     count = 0
     for i, (x, y, bw, bh) in enumerate(boxes, start=1):
         out = f"{stem}_{i}{ext}"
@@ -508,7 +518,8 @@ def _write_crops(path, img, boxes):
     return count
 
 
-def process_image(path, rectangular=False, ai=False, split_lines=False, manual=None):
+def process_image(path, rectangular=False, ai=False, split_lines=False,
+                  manual=None, out_dir=None):
     """Extract sub-images from one image file. Returns the number written.
 
     When `manual` (a context from _load_manual) is given:
@@ -517,6 +528,7 @@ def process_image(path, rectangular=False, ai=False, split_lines=False, manual=N
       * otherwise the detector runs, and if its result looks merged/failed the
         image is queued (no crops written yet); main() draws boxes for the whole
         queue after the batch.
+    Crops are written to out_dir if given, else next to the source.
     """
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
@@ -528,7 +540,7 @@ def process_image(path, rectangular=False, ai=False, split_lines=False, manual=N
     if cached:
         boxes = _order_boxes(list(cached), img.shape[0])
         print(f"  using {len(boxes)} manual box(es) from {os.path.basename(manual['path'])}")
-        return _write_crops(path, img, boxes)
+        return _write_crops(path, img, boxes, out_dir)
 
     boxes = find_subimages(img, rectangular=rectangular, ai=ai, split_lines=split_lines)
 
@@ -539,7 +551,7 @@ def process_image(path, rectangular=False, ai=False, split_lines=False, manual=N
         print("  [manual] automatic split looks merged/failed -- queued for boxing")
         return 0
 
-    count = _write_crops(path, img, boxes)
+    count = _write_crops(path, img, boxes, out_dir)
     if count == 0:
         print(f"  no sub-images found in {path}")
     return count
@@ -597,7 +609,7 @@ def _has_display():
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _draw_and_crop(path, manual, draw_mod):
+def _draw_and_crop(path, manual, draw_mod, out_dir=None):
     """Open the box editor for one queued image and crop from what is drawn."""
     print(f"\n  draw boxes for {path}  "
           "(drag one box per photo; s/Enter=save, q/Esc=skip)")
@@ -608,11 +620,33 @@ def _draw_and_crop(path, manual, draw_mod):
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     boxes = _order_boxes(list(boxes), img.shape[0])
     manual["entries"][os.path.abspath(path)] = boxes
-    return _write_crops(path, img, boxes)
+    return _write_crops(path, img, boxes, out_dir)
+
+
+def _looks_generated(stem, stems):
+    """True if `stem` looks like a sub-image this tool wrote -- "<parent>_<n>"
+    whose parent image is also present -- so a folder scan skips its own outputs.
+    """
+    m = re.match(r"^(.*)_\d+$", stem)
+    return bool(m) and m.group(1) in stems
 
 
 def iter_input_paths(path):
-    """Yield the image path(s) to process for a given input path."""
+    """Yield the image path(s) to process for a given input path.
+
+    An image file yields itself; a folder yields every image in it (sorted,
+    non-recursive, minus its own <stem>_<n> outputs); anything else is treated
+    as a text file listing one image path per line.
+    """
+    if os.path.isdir(path):
+        names = sorted(os.listdir(path))
+        stems = {os.path.splitext(n)[0] for n in names
+                 if os.path.splitext(n)[1].lower() in IMAGE_EXTS}
+        for name in names:
+            stem, ext = os.path.splitext(name)
+            if ext.lower() in IMAGE_EXTS and not _looks_generated(stem, stems):
+                yield os.path.join(path, name)
+        return
     if os.path.splitext(path)[1].lower() in IMAGE_EXTS:
         yield path
         return
@@ -648,6 +682,12 @@ def main(argv):
         i = args.index("--manual")
         manual_path = args[i + 1]
         del args[i:i + 2]
+    out_dir = None
+    for flag in ("--out", "-o"):
+        if flag in args:
+            i = args.index(flag)
+            out_dir = args[i + 1]
+            del args[i:i + 2]
     no_draw = "--no-draw" in args
     args = [a for a in args if a != "--no-draw"]
 
@@ -659,6 +699,8 @@ def main(argv):
     if not os.path.exists(in_path):
         print(f"error: path does not exist: {in_path}")
         return 1
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     if ai:
         import seam_ai
@@ -674,7 +716,7 @@ def main(argv):
     for img_path in iter_input_paths(in_path):
         print(f"processing {img_path}")
         total += process_image(img_path, rectangular=rectangular, ai=ai,
-                               split_lines=split_lines, manual=manual)
+                               split_lines=split_lines, manual=manual, out_dir=out_dir)
 
     # Pass 2: draw boxes for the queued failures, then crop them.
     queued = list(manual["pending"])
@@ -689,7 +731,7 @@ def main(argv):
             print(f"\n{len(queued)} page(s) need manual boxes -- opening the box "
                   "editor for each...")
             for img_path in queued:
-                total += _draw_and_crop(img_path, manual, draw_boxes)
+                total += _draw_and_crop(img_path, manual, draw_boxes, out_dir)
 
     _save_manual(manual)
 
