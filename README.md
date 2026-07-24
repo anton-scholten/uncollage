@@ -1,23 +1,24 @@
-# uncollage
+<p align="center">
+<img src="Logo/Logo.png" width="700" title="Uncollage">
+</p>
 
-Separate a scanned page or collage into its individual sub-images (photos,
-postcards, prints). Detection is based on the uniform scanner/paper background,
-so sub-images may touch each other and the page edge, and may be slightly
-rotated (each is cropped as its upright bounding box, not de-skewed).
+# Uncollage
 
-The toolkit has three programs:
+Separates a scanned page or collage into its individual sub-images (photos, postcards, prints).
+Detection is based on the uniform scanner/paper background, so sub-images may touch each other and the page edge, and may be slightly rotated (but each is cropped using a rectangle surrounding it so no pixel rotations when saving).
+
+This toolkit has three programs:
 
 | Program | What it does |
 |---|---|
-| `uncollage.py` | Main tool: automatic splitting + a manual-boxes fallback for hard pages. |
-| `draw_boxes.py` | A small GUI to draw/edit one box per photo (used by the fallback, or standalone). |
-| `sam_uncollage.py` | Optional: splitting via Meta's pretrained Segment Anything model. |
+| `uncollage.py` | Main tool: automatic splitting + fallback to the pop-up window for difficult collages (see `draw_boxes.py`). |
+| `draw_boxes.py` | Simple GUI to draw and edit bounding boxes for sub-images to be cropped from a collage. Can be used standalone. |
+| `sam_uncollage.py` | Optional code to allow splitting using Meta's pretrained Segment Anything model. |
 
 ## Requirements
 
 - Core: `opencv-python` (cv2) and `numpy`.
-- `sam_uncollage.py` only: `torch`, `torchvision`, `segment-anything`, and the
-  ViT-B checkpoint `sam_vit_b_01ec64.pth` (saved as `sam_vit_b.pth`).
+- For `sam_uncollage.py` only: `torch`, `torchvision`, `segment-anything`, and the ViT-B checkpoint `sam_vit_b_01ec64.pth` (saved as `sam_vit_b.pth`).
 
 ---
 
@@ -29,22 +30,18 @@ python uncollage.py [options] PATH
 
 `PATH` may be:
 - an **image file** → its sub-images are extracted;
-- a **folder** → every image in it is processed (non-recursive). Files that look
-  like sub-images this tool already wrote (`<stem>_<n>` whose parent `<stem>`
-  image is also in the folder) are skipped, so re-running a folder does not
-  re-crop its own outputs;
-- a **text file** → each line is an image path (relative paths resolve against
-  the text file's folder; blank lines and `#` comments are ignored).
+- a **folder** → every image in it is processed (non-recursive).
+  Files that look like sub-images this tool already wrote (e.g. `<original_image>_<n>`) are skipped, so re-running a folder does not re-crop its own outputs;
+- a **text file** → each line is an image path (relative paths based on the text file's folder; blank lines and `#` comments are ignored).
 
-Crops are named `<stem>_1.<ext>`, `<stem>_2.<ext>`, … numbered top-to-bottom then
-left-to-right.
+Crops are named `<original_image>_1.<ext>`, `<original_image>_2.<ext>`, ... numbered top-to-bottom then left-to-right.
 
 ### Options
 
 | Option | Meaning |
 |---|---|
 | `--out DIR`, `-o DIR` | Write every crop into `DIR` (created if needed), keeping each source's base name. Without it, crops go next to their source image. |
-| `--rectangular`, `-r` | Assume sub-images are rectangles and additionally split merged blobs along straight background/shadow seams (guillotine cut). Best for upright photos. |
+| `--rectangular`, `-r` | Assume sub-images are rectangles and additionally split merged blobs along straight background/shadow seams (guillotine cut). Best for non-rotated photos. |
 | `--ai`, `-a` | Like `--rectangular`, but seams come from the small offline net in `seam_ai.py` (needs `seam_model.npz`; train once with `python seam_ai.py train`). |
 | `--split-lines`, `-l` | Also split a blob wherever a **full-span straight** content boundary shows it is several butted-together photos with no gap (e.g. touching postcards). A cut must be straight and leave two pieces that each look like a real photo; a piece left too uniform (a sky/sea slice) is discarded, and a cut that would only peel one off is rejected — so a photo's own straight horizon does not split it. **Off by default** (two textured halves of one photo split by a strong straight edge could over-split); enable only on scans you know are composites. |
 | `--manual FILE` | Path to the manual-boxes cache (default `manual_boxes.txt`). |
@@ -52,20 +49,16 @@ left-to-right.
 
 ### Manual-boxes fallback (for pages that can't be split automatically)
 
-Some pages can't be split automatically — e.g. faded, borderless photos on
-shadowed paper, whose edges aren't visible in the scan. uncollage handles these
+Some pages can't be split automatically (e.g. faded, borderless photos on
+wallpaper with edges difficult to determine). Uncollage handles these
 in one run:
 
 1. **Pass 1** processes every input; clean pages are cropped, and any page whose
    automatic split looks merged/failed is queued.
-2. **Pass 2** opens the box editor (`draw_boxes.py`) for each queued page in
-   turn — the title shows `current/total - name.ext` — you drag one box per
-   photo, and its sub-images are cropped immediately. The boxes are cached in the
-   manual file, saved **after each page** (so a crash never loses completed
-   work), and a later run reuses them without asking again.
+2. **Pass 2** opens the box editor (`draw_boxes.py`) and user draws one box per
+   sub-image for each image (sub-images cropped immediately and box coordinates saved after each image so later runs can reuse the values).
 
-With `--no-draw` (or a headless machine with no display), Pass 2 is skipped; the
-queued pages are listed in the manual file, and you can draw them later:
+With `--no-draw` (or a headless machine with no display), the second pass is skipped and the queued pages are listed in the manual file to be manually drawn later with:
 
 ```
 python uncollage.py scans/                 # crops what it can, queues the rest
