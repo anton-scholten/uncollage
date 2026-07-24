@@ -2,3 +2,5 @@
 manual_boxes.txt
 images_to_process.txt
 __pycache__/
+# regenerable output of tests/gen_collages.py
+tests/collages/

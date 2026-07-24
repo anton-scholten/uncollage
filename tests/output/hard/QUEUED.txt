@@ -1,0 +1,1 @@
+This page cannot be split automatically; uncollage queues it for the manual-boxes fallback (draw_boxes.py).
