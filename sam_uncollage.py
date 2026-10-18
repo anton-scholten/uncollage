@@ -218,7 +218,7 @@ def process_image(path, checkpoint=DEFAULT_CKPT, boxes_file=None, debug=False):
         boxes = find_subimages_auto(img, checkpoint)
 
     stem = os.path.splitext(path)[0]
-    count = uncollage._write_crops(path, raw, boxes)
+    count = uncollage._write_crops(path, raw, boxes, overwrite=True)  # explicit re-crop
     if debug:
         vis = img.copy()
         for x, y, bw, bh in boxes:

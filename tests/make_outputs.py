@@ -41,7 +41,7 @@ def main():
 
         manual = {"entries": {}, "pending": [], "path": os.path.join(folder, "m.txt")}
         n = uncollage.process_image(os.path.join(folder, f"{name}.png"),
-                                    manual=manual, out_dir=folder, **flags)
+                                    manual=manual, out_dir=folder, overwrite=True, **flags)
         flag_s = " ".join(f"--{k.replace('_', '-')}" for k, v in flags.items() if v) or "(plain)"
         if needs_manual:
             with open(os.path.join(folder, "QUEUED.txt"), "w") as f:

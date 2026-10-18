@@ -33,8 +33,9 @@ python uncollage.py INPUT [OUTPUT]
   skipped) or a text file with one image path per line.
 - `OUTPUT`: folder for the crops; default is next to each source.
 
-Crops are named `<image>_1`, `<image>_2`, … row by row, left to right; a
-re-run overwrites crops of the same name. A
+Crops are named `<image>_1`, `<image>_2`, … row by row, left to right. Pages
+that already have crops in the output folder are skipped, so a re-run never
+overwrites anything and simply resumes an interrupted batch. A
 lossless source keeps its format; JPEG/WebP crops are saved as PNG, since
 re-encoding would change pixels. Crops whose colour channels are identical are
 saved as one-channel grey (same values, a third of the size). EXIF orientation
@@ -44,7 +45,8 @@ is not applied.
 |---|---|
 | `-t`, `--touching` | Also cut photos butted together with **no** gap (straight shadow seams and print edges). Off by default: it can cut a photo along its own straight horizon. |
 | `-d`, `--debug` | Write contact sheets into `uncollage_debug/` in the output folder: every page with its numbered boxes, 12 per sheet. Red = cropped, magenta = queued, green = from the manual file, blue = drawn this run. |
-| `-j N`, `--jobs N` | Pages processed in parallel (default: all cores, as free memory allows; ~3.5x faster on 6 cores). |
+| `--overwrite` | Re-crop pages that already have crops, replacing them. |
+| `-j N`, `--cores N` | CPU cores to use; `1` = one page at a time. Default: all cores (~3.5x faster on 6), fewer only if free memory is short. |
 | `--no-draw` | Don't open the editor; just list failed pages in the manual file. |
 | `--manual FILE` | Manual-boxes file (default `manual_boxes.txt`). |
 

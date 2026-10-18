@@ -3,7 +3,8 @@
 uncollage.py -- Separate scanned pages / collages into their individual photos.
 
 Usage:
-    python uncollage.py INPUT [OUTPUT] [--touching] [--debug] [--jobs N] [--no-draw] [--manual FILE]
+    python uncollage.py INPUT [OUTPUT] [--overwrite] [--cores N] [--touching] [--debug]
+                        [--no-draw] [--manual FILE]
 
   INPUT   an image, a folder of images (non-recursive), or a text file listing
           one image path per line (blank lines and '#' comments ignored;
@@ -25,8 +26,12 @@ Usage:
                    folder): every page as a thumbnail with its boxes numbered
                    like the crops -- red cropped, magenta queued, green from
                    the manual file, blue drawn this run -- 12 pages a sheet.
-  --jobs N (-j N)  pages processed in parallel (default: all cores, as far as
-                   free memory allows).
+  --cores N (-j N) CPU cores to use: pages are processed in parallel, one per
+                   core; 1 = one at a time. Default: all cores (fewer only if
+                   free memory is short, ~1.5 GB per 1200 dpi page).
+  --overwrite      re-crop pages that already have crops in the output folder
+                   and replace them. By default such pages are skipped, so a
+                   re-run never overwrites and resumes an interrupted batch.
   --no-draw        do not open the box editor for pages that could not be split
                    (see below); just list them in the manual-boxes file.
   --manual FILE    manual-boxes file (default manual_boxes.txt).
@@ -843,43 +848,82 @@ def read_image(path):
     return cv2.imread(path, cv2.IMREAD_UNCHANGED)
 
 
-def _write_crops(path, img, boxes, out_dir=None):
-    """Write each box as <stem>_<n>.<ext>, pixel-identical to the source: a
-    lossless format is kept, a lossy one (LOSSY_EXTS) becomes PNG. A crop of a
-    colour image whose channels are all equal (a grey photo, or a grey scan
-    stored as RGB) is written as one grey channel -- the same pixel values in
-    a third of the space; each crop is judged on its own. With
-    out_dir, crops go there (keeping the source's base name); otherwise next to
-    the source. Boxes are clipped to the image. Returns the count written."""
+def _crop_base(path, out_dir=None):
+    """(stem, ext) of a source's crop files: <stem>_<n><ext>. A lossless
+    format is kept, a lossy one (LOSSY_EXTS) becomes PNG; with out_dir the
+    crops go there (keeping the source's base name), otherwise next to it."""
     stem, ext = os.path.splitext(path)
     if ext.lower() not in IMAGE_EXTS or ext.lower() in LOSSY_EXTS:
         ext = ".png"
     if out_dir:
         stem = os.path.join(out_dir, os.path.basename(stem))
+    return stem, ext
+
+
+def _existing_crops(path, out_dir=None):
+    """{n: file} of the crops of `path` already in its output folder."""
+    stem, ext = _crop_base(path, out_dir)
+    folder, base = os.path.split(stem)
+    pat = re.compile(re.escape(base) + r"_(\d+)" + re.escape(ext) + "$")
+    try:
+        names = os.listdir(folder or ".")
+    except OSError:
+        return {}
+    return {int(m.group(1)): os.path.join(folder, n)
+            for n in names for m in [pat.match(n)] if m}
+
+
+def _write_crops(path, img, boxes, out_dir=None, overwrite=False):
+    """Write each box as <stem>_<n><ext> (see _crop_base), pixel-identical to
+    the source. A crop of a colour image whose channels are all equal (a grey
+    photo, or a grey scan stored as RGB) is written as one grey channel -- the
+    same pixel values in a third of the space; each crop is judged on its own.
+    Boxes are clipped to the image. An existing file is kept unless
+    `overwrite`. A page's crops are written under temporary ".part" names
+    and renamed once all are written, so an interrupted or failed write never
+    leaves a page looking finished (re-runs skip pages that have crops).
+    Returns the number of crops in place (written or kept)."""
+    stem, ext = _crop_base(path, out_dir)
     params = [cv2.IMWRITE_PNG_COMPRESSION, 1] if ext.lower() == ".png" else []
     H, W = img.shape[:2]
-    count = 0
+    count, done, failed = 0, [], False
     for i, (x, y, bw, bh) in enumerate(boxes, start=1):
         x0, y0 = max(0, x), max(0, y)
         x1, y1 = min(W, x + bw), min(H, y + bh)
         out = f"{stem}_{i}{ext}"
+        part = f"{stem}_{i}.part{ext}"          # cv2 picks the format by extension
+        if not overwrite and os.path.exists(out):
+            print(f"  [keep] already exists: {out}")
+            count += 1
+            continue
         crop = img[y0:y1, x0:x1]
         if crop.ndim == 3 and crop.shape[2] == 3 and \
                 (crop[..., 0] == crop[..., 1]).all() and (crop[..., 1] == crop[..., 2]).all():
             crop = crop[..., 0]
         try:
-            ok = x1 > x0 and y1 > y0 and cv2.imwrite(out, crop, params)
+            ok = x1 > x0 and y1 > y0 and cv2.imwrite(part, crop, params)
         except cv2.error:                       # some write failures raise instead
             ok = False
         if ok:
-            count += 1
+            done.append((part, out))
             print(f"  wrote {out}  ({x1 - x0}x{y1 - y0})")
         else:
             print(f"  [skip] could not write: {out}")
+            failed = True
+            if os.path.exists(part):
+                os.remove(part)
+    if failed:            # publish nothing, so a re-run redoes the whole page
+        for part, _ in done:
+            os.remove(part)
+        return count
+    for part, out in done:                       # the page is complete: publish
+        os.replace(part, out)
+        count += 1
     return count
 
 
-def _process_one(path, rectangular, split_lines, cached, check, out_dir, want_tile):
+def _process_one(path, rectangular, split_lines, cached, check, out_dir, want_tile,
+                 overwrite=False):
     """Do one page's work without touching shared state, so it can run in a
     worker process. Returns {"count", "queued", "boxes", "tile"}: crops
     written (and "failed": crops that could not be written), whether the page
@@ -904,15 +948,16 @@ def _process_one(path, rectangular, split_lines, cached, check, out_dir, want_ti
         print("  [manual] automatic split looks merged/failed -- queued for boxing")
         res["queued"] = True
         return res
-    res["count"] = _write_crops(path, img, boxes, out_dir)
+    res["count"] = _write_crops(path, img, boxes, out_dir, overwrite)
     res["failed"] = len(boxes) - res["count"]
+    _note_leftovers(path, out_dir, len(boxes))
     if res["count"] == 0:
         print(f"  no sub-images found in {path}")
     return res
 
 
 def process_image(path, rectangular=False, split_lines=False,
-                  manual=None, out_dir=None, debug=None):
+                  manual=None, out_dir=None, debug=None, overwrite=False):
     """Extract sub-images from one image file. Returns the number written.
 
     When `manual` (a context from _load_manual) is given:
@@ -924,13 +969,24 @@ def process_image(path, rectangular=False, split_lines=False,
         after the batch.
     Crops are written to out_dir if given, else next to the source. With a
     `debug` dict, a thumbnail of the page and its boxes is added to it for the
-    contact sheets (see _debug_tile).
+    contact sheets (see _debug_tile). Existing crop files are kept unless
+    `overwrite`.
     """
     cached = manual["entries"].get(os.path.abspath(path)) if manual is not None else None
     res = _process_one(path, rectangular, split_lines, cached, manual is not None,
-                       out_dir, debug is not None)
+                       out_dir, debug is not None, overwrite)
     _record(path, res, manual, debug)
     return res["count"]
+
+
+def _note_leftovers(path, out_dir, n):
+    """After re-cropping a page into n crops, point out older crops of it with
+    higher numbers (from a run that found more photos); they are left alone,
+    since a file named like a crop could be an original."""
+    old = sorted(f for k, f in _existing_crops(path, out_dir).items() if k > n)
+    if old:
+        print(f"  [note] {len(old)} older crop(s) of this page remain: "
+              + ", ".join(os.path.basename(f) for f in old))
 
 
 def _record(path, res, manual, debug):
@@ -1024,7 +1080,7 @@ def _has_display():
 
 
 def _draw_and_crop(path, manual, draw_mod, out_dir=None, index=None, total=None,
-                   debug=None):
+                   debug=None, overwrite=False):
     """Open the box editor for one queued image and crop from what is drawn.
     Returns (crops written, crops that could not be written)."""
     print(f"\n  draw boxes for {path}  "
@@ -1040,7 +1096,8 @@ def _draw_and_crop(path, manual, draw_mod, out_dir=None, index=None, total=None,
     manual["entries"][os.path.abspath(path)] = boxes
     if debug is not None:
         debug[os.path.abspath(path)] = _debug_tile(path, img, boxes, "drawn")
-    n = _write_crops(path, img, boxes, out_dir)
+    n = _write_crops(path, img, boxes, out_dir, overwrite)
+    _note_leftovers(path, out_dir, len(boxes))
     return n, len(boxes) - n
 
 
@@ -1154,9 +1211,12 @@ def main(argv):
                     help="do not open the box editor for failed pages")
     ap.add_argument("--manual", default=MANUAL_FILE_DEFAULT, metavar="FILE",
                     help="manual-boxes file (default %(default)s)")
-    ap.add_argument("-j", "--jobs", type=int, default=0, metavar="N",
-                    help="pages processed in parallel (default: all cores, "
-                         "as far as free memory allows)")
+    ap.add_argument("-j", "--cores", dest="jobs", type=int, default=0,
+                    metavar="N", help="CPU cores to use, i.e. pages processed in "
+                    "parallel; 1 = one at a time (default: all cores)")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="re-crop pages that already have crops in the output "
+                         "folder, replacing them (default: skip such pages)")
     ap.add_argument("-d", "--debug", action="store_true",
                     help=f"also write contact sheets of every page and its boxes "
                          f"into {DEBUG_DIR}/ in the output folder")
@@ -1175,8 +1235,14 @@ def main(argv):
     # Pass 1: process every image, several at once; failures are queued in
     # manual["pending"] (in input order).
     paths = list(iter_input_paths(in_path))
+    if not opt.overwrite:                       # never redo / overwrite finished pages
+        done = [p for p in paths if _existing_crops(p, out_dir)]
+        if done:
+            print(f"{len(done)} page(s) already have crops -- skipped "
+                  f"(add --overwrite to re-crop them)")
+            paths = [p for p in paths if p not in set(done)]
     kw = dict(rectangular=opt.touching, split_lines=opt.touching, check=True,
-              out_dir=out_dir, want_tile=debug is not None)
+              out_dir=out_dir, want_tile=debug is not None, overwrite=opt.overwrite)
     jobs = [(p, dict(kw, cached=manual["entries"].get(os.path.abspath(p)))) for p in paths]
     n_jobs = min(len(jobs), opt.jobs if opt.jobs > 0 else _default_jobs())
     if n_jobs > 1:
@@ -1208,7 +1274,7 @@ def main(argv):
             nq = len(queued)
             for k, img_path in enumerate(queued, 1):
                 n, nf = _draw_and_crop(img_path, manual, draw_boxes, out_dir, k, nq,
-                                       debug=debug)
+                                       debug=debug, overwrite=opt.overwrite)
                 total, failed = total + n, failed + nf
                 _save_manual(manual)    # persist after each crop, in case of a crash
 

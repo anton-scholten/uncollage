@@ -159,6 +159,50 @@ def test_corner_box_tight():
     assert _corner_box_tight()
 
 
+def _no_overwrite_ok():
+    """Existing crops are kept by default and replaced with overwrite=True."""
+    import cv2
+    out = tempfile.mkdtemp()
+    src = os.path.join(out, "page.png")
+    cv2.imwrite(src, gen_collages.separated())
+    uncollage.process_image(src, out_dir=out)
+    crop = os.path.join(out, "page_1.png")
+    with open(crop, "wb") as f:
+        f.write(b"marker")                          # stand-in for a user's file
+    uncollage.process_image(src, out_dir=out)
+    kept = open(crop, "rb").read() == b"marker"
+    uncollage.process_image(src, out_dir=out, overwrite=True)
+    return kept and open(crop, "rb").read() != b"marker"
+
+
+def _failed_page_unpublished():
+    """If any crop of a page fails to write, none is published (so a re-run,
+    which skips pages that have crops, redoes it) and no temp file remains."""
+    import cv2
+    out = tempfile.mkdtemp()
+    page = gen_collages.separated()
+    real, calls = cv2.imwrite, []
+
+    def flaky(path, *a):
+        calls.append(path)
+        return False if len(calls) == 3 else real(path, *a)
+    cv2.imwrite = flaky
+    try:
+        n = uncollage._write_crops(os.path.join(out, "page.png"), page,
+                                   uncollage.find_subimages(page), out)
+    finally:
+        cv2.imwrite = real
+    return n == 0 and os.listdir(out) == []
+
+
+def test_no_overwrite():
+    assert _no_overwrite_ok()
+
+
+def test_failed_page_unpublished():
+    assert _failed_page_unpublished()
+
+
 def test_order_boxes():
     assert _order_ok()
 
@@ -207,6 +251,8 @@ def _main():
     check("grey crop 1-ch", _grey_crops_one_channel())
     check("crop numbering", _order_ok())
     check("edge line ignored", _corner_box_tight())
+    check("keep existing", _no_overwrite_ok())
+    check("failed page", _failed_page_unpublished())
     check("debug sheets", _debug_sheets_ok())
 
     w = max(len(r[0]) for r in rows)

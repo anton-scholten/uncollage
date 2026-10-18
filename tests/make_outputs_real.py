@@ -31,7 +31,7 @@ def main():
         cv2.imwrite(os.path.join(folder, f"{name}.png"), build())
         manual = {"entries": {}, "pending": [], "path": os.path.join(folder, "m.txt")}
         n = uncollage.process_image(os.path.join(folder, f"{name}.png"),
-                                    manual=manual, out_dir=folder, **flags)
+                                    manual=manual, out_dir=folder, overwrite=True, **flags)
         if needs_manual:
             with open(os.path.join(folder, "QUEUED.txt"), "w") as f:
                 f.write("Cannot be split automatically on real photos; uncollage "
