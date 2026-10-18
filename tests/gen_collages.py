@@ -215,6 +215,21 @@ def corner(tile=_photo):
     return page
 
 
+def thin_gap(tile=_photo):
+    """2 photos side by side separated only by a thin strip of paper that the
+    prints' shadows grey down -- too thin to survive in the mask; plain mode
+    still cuts along it and finds 2."""
+    rng = np.random.default_rng(10)
+    H, W = 800, 1000
+    page = _paper_bg(rng, H, W)
+    page[60:740, 40:490] = tile(rng, 680, 450)
+    page[70:750, 500:960] = tile(rng, 680, 460)
+    gap = page[60:750, 490:500].astype(np.float32)
+    page[60:750, 490:500] = np.clip(gap - 20 + rng.normal(0, 6, gap.shape), 0, 255)
+    page[60:750, 490] = page[60:750, 499] = 150                     # shadow edges
+    return page
+
+
 # name, builder, uncollage flags, expected sub-image count, needs-manual?
 SCENARIOS = [
     ("separated", separated, {}, 4, False),
@@ -226,6 +241,7 @@ SCENARIOS = [
     ("tinted", tinted, {}, 4, False),
     ("dark", dark, {}, 3, False),
     ("corner", corner, {}, 2, False),
+    ("thin_gap", thin_gap, {}, 2, False),
 ]
 
 

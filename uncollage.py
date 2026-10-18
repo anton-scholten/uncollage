@@ -50,9 +50,11 @@ Method:
   * A pixel is background when it is smooth and close to that surface, and
     connected to the page border; enclosed pale areas (sky, snow) stay photo.
   * Each large foreground blob is one photo. A blob that is not
-    rectangle-shaped (photos touching at a corner or across a shadow) is cut
-    with a growing morphological opening, kept only if every piece is a large,
-    more rectangular blob.
+    rectangle-shaped (photos touching at a corner or across a shadow) is
+    eroded into one core per photo and every pixel given to its nearest core;
+    photos parted by a paper gap too thin for the mask are cut along that
+    straight paper-coloured line. Either split is kept only if every piece is
+    a large, clearly rectangular blob.
   * With --touching, blobs are further cut along straight shadow seams
     (guillotine) and full-span straight print edges.
   Each photo is cropped as the UPRIGHT bounding box of its region (no
@@ -90,6 +92,9 @@ KEEP_AREA_FRAC = 0.05    # ... but a blob this large is kept whatever its shape
 SPLIT_FILL = 0.95        # a blob filling its rotated rect less than this may be
 SPLIT_PIECE_FILL = 0.85  # ... and is cut only into pieces at least this rectangular
 SPLIT_KERNELS = (0.01, 0.02, 0.04, 0.08)  # touching photos: tried opening sizes (x page)
+PAPER_SEAM_K = 3.0       # thin paper gap filled in by the mask: pixels within
+PAPER_SEAM_MIN = 0.90    # this x tol of the paper over >= this of a line ...
+PAPER_SEAM_CONTRAST = 0.40  # ... and this much more paper-like than just beside it
 WORK_MAX = 3000          # detection runs on a copy downscaled to this long side
                          # (high-dpi scans: faster, less grain; boxes scaled back)
 BOX_PAD = 0.003          # crop boxes grow by this fraction of the page's long
@@ -239,8 +244,9 @@ def _local_std(gray, win):
 
 
 def foreground_mask(img):
-    """Return (mask, field): a binary mask (uint8 0/255) whose blobs are the
-    sub-images, and the per-pixel background colour it was measured against."""
+    """Return (mask, field, tol): a binary mask (uint8 0/255) whose blobs are
+    the sub-images, the per-pixel background colour it was measured against,
+    and the colour tolerance used."""
     h, w = img.shape[:2]
 
     # Local texture (rolling standard deviation). Kept small so that thin
@@ -258,7 +264,7 @@ def foreground_mask(img):
     k = max(3, int(round(min(h, w) * 0.004)) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=1)
-    return fg, field
+    return fg, field, tol
 
 
 def _seam_maps(img, field):
@@ -412,6 +418,56 @@ def _split_touching(blob, min_area):
                for q in leaves):
             return leaves
     return [blob]
+
+
+def _split_paper_seam(img, blob, near_paper, min_area, depth=0):
+    """Split a blob along a thin strip of paper between two photos -- a gap a
+    few pixels wide, greyed by the prints' shadows and edges, that the mask
+    filled in. Such a strip is a straight line across (almost) the whole blob
+    whose pixels are close to the paper colour (within PAPER_SEAM_K x the
+    tolerance) while the pixels a little to either side are not. The cut is
+    kept only if it leaves two large, clearly rectangular pieces that each
+    hold real photo content -- so a pale photo, paper-coloured over wide
+    areas, has no such narrow seam and stays whole."""
+    if depth >= SEAM_MAX_DEPTH:
+        return [blob]
+    # no shortcut for already-rectangular blobs: two aligned prints with a
+    # thin gap form a near-perfect rectangle
+    fill, _ = _rect_fill(blob)
+    x, y, bw, bh = cv2.boundingRect(blob)
+    sub = blob[y:y + bh, x:x + bw] > 0
+    # a seam pixel is near-paper inside the blob, or already background (the
+    # part of the gap the mask did keep)
+    gap = near_paper[y:y + bh, x:x + bw] | ~sub
+    best = None
+    for axis, extent in ((0, bw), (1, bh)):                  # 0: vertical seam
+        frac = gap.mean(axis)
+        m, d = int(LINE_MARGIN * extent), max(3, int(0.02 * extent))
+        for j in range(max(m, d), extent - max(m, d)):
+            if frac[j] < PAPER_SEAM_MIN:
+                continue
+            if frac[j] - max(frac[j - d], frac[j + d]) < PAPER_SEAM_CONTRAST:
+                continue
+            if best is None or frac[j] > best[0]:
+                best = (frac[j], axis, j, d)
+    if best is None:
+        return [blob]
+    _, axis, j, d = best
+    trial = blob.copy()
+    t = max(1, d // 2)
+    if axis == 0:
+        trial[y:y + bh, x + j - t:x + j + t + 1] = 0
+    else:
+        trial[y + j - t:y + j + t + 1, x:x + bw] = 0
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(trial)
+    pieces = [(labels == i).astype(np.uint8) * 255
+              for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+    if len(pieces) < 2 or not all(_rect_fill(p)[0] >= min(fill, SPLIT_FILL)
+                                  and _rect_fill(p)[0] > SPLIT_PIECE_FILL
+                                  and not _blob_uniform(img, p) for p in pieces):
+        return [blob]
+    return [q for p in pieces
+            for q in _split_paper_seam(img, p, near_paper, min_area, depth + 1)]
 
 
 def _blob_to_box(blob, keep_area):
@@ -586,14 +642,18 @@ def find_subimages(img, rectangular=False, split_lines=False):
     if scale < 1.0:
         img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     h, w = img.shape[:2]
-    mask, field = foreground_mask(img)
+    mask, field, tol = foreground_mask(img)
     min_area = MIN_AREA_FRAC * h * w
 
     # Split the mask into connected foreground blobs, separating photos that
-    # touch at a corner or across a shadow.
+    # touch at a corner or across a shadow, then photos separated only by a
+    # gap too thin to survive in the mask.
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
     blobs = [piece for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area
              for piece in _split_touching((labels == i).astype(np.uint8) * 255, min_area)]
+    near_paper = _color_dist(img, field) < PAPER_SEAM_K * tol
+    blobs = [piece for blob in blobs
+             for piece in _split_paper_seam(img, blob, near_paper, min_area)]
 
     if rectangular and blobs:
         seam_h, seam_v = _seam_maps(img, field)

@@ -35,6 +35,7 @@ Each prints a PASS/FAIL table and exits non-zero on failure; both also run under
 | `tinted` — coloured paper, strong lighting gradient | *(plain)* | 4 crops |
 | `dark` — mostly-black photos + scanner-lid strip | *(plain)* | 3 crops |
 | `corner` — 2 photos meeting at a corner via a shadow | *(plain)* | 2 crops |
+| `thin_gap` — 2 aligned photos, only a thin shadowed paper strip between | *(plain)* | 2 crops |
 
 (`--rectangular` and `--split-lines` are the `find_subimages` keywords; the
 CLI's `--touching` turns on both.)

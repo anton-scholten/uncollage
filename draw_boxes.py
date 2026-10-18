@@ -17,16 +17,19 @@ Usage:
   draw are written back onto its line (add --redo to also redraw lines that
   already have boxes). Then re-run your uncollage.py command to use them.
 
-The window is resizable -- drag its border to enlarge it and zoom into the
-image. In list mode the title shows progress as "current/total - name.ext", and
-the file is rewritten after every image so a crash never loses drawn boxes.
+The window opens showing the whole page and is resizable. In list mode the
+title shows progress as "current/total - name.ext", and the file is rewritten
+after every image so a crash never loses drawn boxes.
 
 Controls (in the window):
     drag inside / empty    draw a new box (may overlap existing boxes)
     drag a corner handle   resize the box under the cursor
     drag a box's edge      move that box
+    mouse wheel            zoom in/out around the cursor
+    right/middle drag      pan
     toolbar buttons        Undo / Clear / Save / Cancel  (hover for a tooltip)
     keys                   u=undo  r=clear  s/Enter=save  q/Esc=cancel
+                           f=whole page  w=fit width  +/-=zoom
 
 Overlapping boxes are supported: because only a box's edge (or corner) grabs it,
 a drag that starts inside a box makes a new box instead of moving the old one,
@@ -35,33 +38,40 @@ so overlapping sub-images can each get their own box.
 Boxes are written one "x y w h" per line in SOURCE-image pixels. With --run,
 sam_uncollage.py is invoked on the image with the saved boxes afterwards.
 
-Requires: opencv-python (cv2) with GUI support, numpy.
+The window is plain Tk (Python's standard tkinter), so it uses the OS's fonts
+and needs no GUI build of OpenCV.
+
+Requires: opencv-python (cv2), numpy, tkinter. Optional: Pillow (faster redraws).
 """
 
 import os
 import subprocess
 import sys
-
-# This cv2 build's Qt has no Wayland platform plugin; use XWayland (xcb) so the
-# window opens on a Wayland desktop. Harmless on X11. Override by exporting
-# QT_QPA_PLATFORM yourself before running.
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+import tkinter as tk
 
 import cv2
 import numpy as np
 
-MAX_VIEW = 1400          # working buffer long side (the window is resizable, so a
-                         # larger buffer means more detail when zoomed in)
-INIT_VIEW = 950          # initial on-screen window long side (fits a laptop screen)
+try:                     # optional: Pillow hands frames to Tk ~4x faster than PPM
+    from PIL import Image, ImageTk
+except ImportError:
+    ImageTk = None
+
+MAX_VIEW = 3000          # working buffer long side: the detail available when zoomed
+INIT_VIEW = 950          # initial window long side (fits a laptop screen)
+ZOOM_STEP = 1.2          # zoom factor per wheel notch
+ZOOM_MAX = 8.0           # max screen px per buffer px
+BUTTON_FONT = ("TkDefaultFont", 24)
+TIP_FONT = ("TkDefaultFont", 12)
+TIP_DX, TIP_DY = 40, 24  # tooltip offset from the cursor (clear of a big cursor)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-_FONT = cv2.FONT_HERSHEY_SIMPLEX
-_GRAB = 10               # how close (px) the cursor must be to grab a corner
+_GRAB = 10               # how close (screen px) the cursor must be to grab a corner
 _HALF = 4                # half-size of a drawn corner handle
 
 # The only options the window needs: id, label, and the hover tooltip text.
 _BUTTONS = [
-    ("undo", "Undo", "Remove the last box"),
-    ("clear", "Clear", "Remove all boxes"),
+    ("undo", "Undo", "Remove the last box  (u)"),
+    ("clear", "Clear", "Remove all boxes  (r)"),
     ("save", "Save", "Save boxes and close  (Enter)"),
     ("cancel", "Cancel", "Discard changes and close  (Esc)"),
 ]
@@ -101,41 +111,44 @@ def _hit_edge(boxes, mx, my, r=_GRAB):
     return None
 
 
-def _layout_buttons():
-    buttons = []
-    bx, by, bh = 8, 8, 30
-    for bid, label, tip in _BUTTONS:
-        (tw, _), _ = cv2.getTextSize(label, _FONT, 0.55, 1)
-        bw = tw + 22
-        buttons.append({"id": bid, "label": label, "tip": tip,
-                        "rect": (bx, by, bw, bh)})
-        bx += bw + 8
-    return buttons
+class _Tooltip:
+    """A small OS-font tooltip shown beside the cursor while over a widget."""
 
+    def __init__(self, widget, text):
+        self.widget, self.text, self.win, self.job = widget, text, None, None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
 
-def _hit_button(buttons, mx, my):
-    for b in buttons:
-        bx, by, bw, bh = b["rect"]
-        if bx <= mx <= bx + bw and by <= my <= by + bh:
-            return b["id"]
-    return None
+    def _schedule(self, _):
+        self.job = self.widget.after(400, self._show)
 
+    def _show(self):
+        x = self.widget.winfo_pointerx() + TIP_DX
+        y = self.widget.winfo_pointery() + TIP_DY
+        self.win = tk.Toplevel(self.widget)
+        self.win.wm_overrideredirect(True)
+        self.win.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.win, text=self.text, font=TIP_FONT, bg="#2b2b2b", fg="white",
+                 padx=8, pady=4, relief="solid", borderwidth=1).pack()
 
-def _tooltip(vis, text, mx, my):
-    (tw, th), _ = cv2.getTextSize(text, _FONT, 0.5, 1)
-    pad = 6
-    x = min(mx + 14, vis.shape[1] - tw - 2 * pad - 2)
-    y = min(my + 18, vis.shape[0] - th - 2 * pad - 2)
-    cv2.rectangle(vis, (x, y), (x + tw + 2 * pad, y + th + 2 * pad), (30, 30, 30), -1)
-    cv2.rectangle(vis, (x, y), (x + tw + 2 * pad, y + th + 2 * pad), (200, 200, 200), 1)
-    cv2.putText(vis, text, (x + pad, y + pad + th), _FONT, 0.5, (255, 255, 255), 1)
+    def _hide(self, _=None):
+        if self.job:
+            self.widget.after_cancel(self.job)
+            self.job = None
+        if self.win:
+            self.win.destroy()
+            self.win = None
 
 
 def draw(image_path, index=None, total=None):
     """Open a window to draw/edit one box per photo. Returns [(x,y,w,h), ...] in
-    source pixels on save, or None if cancelled. The window is resizable -- drag
-    its border to enlarge it and zoom into the image. When `index`/`total` are
-    given the title is "index/total - name.ext".
+    source pixels on save, or None if cancelled. When `index`/`total` are given
+    the title is "index/total - name.ext".
+
+    The window opens showing the whole page; the mouse wheel zooms around the
+    cursor, a right/middle drag pans, `f` shows the whole page again and `w`
+    fits the width. The toolbar stays put above the image.
 
     Drag to add a box; drag a corner handle to resize; drag a box's EDGE to move
     it. Only the edge/corner grabs a box, so a drag starting inside a box makes a
@@ -149,124 +162,243 @@ def draw(image_path, index=None, total=None):
         return None
     h, w = img.shape[:2]
     scale = min(1.0, MAX_VIEW / max(h, w))
-    view0 = cv2.resize(img, (int(round(w * scale)), int(round(h * scale)))) \
-        if scale < 1.0 else img.copy()
-    vh, vw = view0.shape[:2]
-    buttons = _layout_buttons()
+    buf = cv2.resize(img, (int(round(w * scale)), int(round(h * scale))),
+                     interpolation=cv2.INTER_AREA) if scale < 1.0 else img
+    buf = cv2.cvtColor(buf, cv2.COLOR_BGR2RGB)
+    vh, vw = buf.shape[:2]
+    # Pre-shrunk copies (1, 1/2, 1/4, ...): a frame is resized from the
+    # smallest copy still at least as detailed as the zoom, which keeps every
+    # redraw a cheap linear resize instead of a full-page area resize.
+    pyramid = [buf]
+    while max(pyramid[-1].shape[:2]) > 400:
+        pyramid.append(cv2.resize(pyramid[-1], None, fx=0.5, fy=0.5,
+                                  interpolation=cv2.INTER_AREA))
 
-    boxes = []               # each a [x0, y0, x1, y1] in VIEW coords
-    # mode: None | 'new' | 'resize' | 'move' | 'button'
-    state = {"mode": None, "idx": -1, "corner": -1, "off": (0, 0),
-             "mx": -1, "my": -1, "btn": None, "action": None}
-
-    def render():
-        vis = view0.copy()
-        active_edit = state["mode"] in ("new", "resize", "move")
-        for i, box in enumerate(boxes, 1):
-            x0, y0, x1, y1 = _norm(box)
-            colour = (0, 200, 0) if (state["mode"] != "button"
-                                     and i - 1 == state["idx"]) else (0, 0, 255)
-            cv2.rectangle(vis, (x0, y0), (x1, y1), colour, 2)
-            cv2.putText(vis, str(i), (x0 + 4, y0 + 20), _FONT, 0.6, colour, 2)
-            for cx, cy in _corners([x0, y0, x1, y1]):
-                cv2.rectangle(vis, (cx - _HALF, cy - _HALF),
-                              (cx + _HALF, cy + _HALF), (255, 255, 255), -1)
-                cv2.rectangle(vis, (cx - _HALF, cy - _HALF),
-                              (cx + _HALF, cy + _HALF), (0, 0, 255), 1)
-        hovering = _hit_button(buttons, state["mx"], state["my"]) \
-            if not active_edit else None
-        for b in buttons:
-            bx, by, bw, bh = b["rect"]
-            bg = (110, 110, 110) if b["id"] == hovering else (70, 70, 70)
-            cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), bg, -1)
-            cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), (220, 220, 220), 1)
-            (tw, th), _ = cv2.getTextSize(b["label"], _FONT, 0.55, 1)
-            cv2.putText(vis, b["label"], (bx + (bw - tw) // 2, by + (bh + th) // 2),
-                        _FONT, 0.55, (255, 255, 255), 1)
-        if hovering:
-            tip = next(b["tip"] for b in buttons if b["id"] == hovering)
-            _tooltip(vis, tip, state["mx"], state["my"])
-        return vis
-
-    def on_mouse(event, mx, my, flags, _):
-        mx = max(0, min(mx, vw - 1))
-        my = max(0, min(my, vh - 1))
-        state["mx"], state["my"] = mx, my
-        if event == cv2.EVENT_LBUTTONDOWN:
-            b = _hit_button(buttons, mx, my)
-            if b is not None:
-                state.update(mode="button", btn=b)
-                return
-            hc = _hit_corner(boxes, mx, my)
-            if hc is not None:
-                state.update(mode="resize", idx=hc[0], corner=hc[1])
-                return
-            he = _hit_edge(boxes, mx, my)          # only the border grabs a box
-            if he is not None:
-                x0, y0, _, _ = _norm(boxes[he])
-                state.update(mode="move", idx=he, off=(mx - x0, my - y0))
-                return
-            boxes.append([mx, my, mx, my])         # interior/empty -> new box
-            state.update(mode="new", idx=len(boxes) - 1)
-        elif event == cv2.EVENT_MOUSEMOVE:
-            if state["mode"] == "new":
-                boxes[state["idx"]][2:] = [mx, my]
-            elif state["mode"] == "resize":
-                box = boxes[state["idx"]]
-                box[0 if state["corner"] in (0, 3) else 2] = mx
-                box[1 if state["corner"] in (0, 1) else 3] = my
-            elif state["mode"] == "move":
-                box = boxes[state["idx"]]
-                bw, bh = box[2] - box[0], box[3] - box[1]
-                ox, oy = state["off"]
-                nx = max(0, min(mx - ox, vw - 1 - bw))
-                ny = max(0, min(my - oy, vh - 1 - bh))
-                boxes[state["idx"]] = [nx, ny, nx + bw, ny + bh]
-        elif event == cv2.EVENT_LBUTTONUP:
-            if state["mode"] == "button":
-                if _hit_button(buttons, mx, my) == state["btn"]:
-                    state["action"] = state["btn"]
-            elif state["mode"] in ("new", "resize", "move"):
-                i = state["idx"]
-                boxes[i] = _norm(boxes[i])
-                x0, y0, x1, y1 = boxes[i]
-                if x1 - x0 <= 5 or y1 - y0 <= 5:      # discard degenerate box
-                    boxes.pop(i)
-            state.update(mode=None, idx=-1, corner=-1, btn=None)
+    boxes = []               # each a [x0, y0, x1, y1] in BUFFER coords
+    # mode: None | 'new' | 'resize' | 'move' | 'pan'
+    st = {"mode": None, "idx": -1, "corner": -1, "off": (0, 0), "pan": (0, 0, 0, 0)}
+    # view: z = screen px per buffer px; (ox, oy) = buffer point at the
+    # canvas's top-left corner
+    view = {"z": 1.0, "ox": 0.0, "oy": 0.0, "cw": 1, "ch": 1, "fit": "page"}
+    result = {"saved": False}
 
     name = os.path.basename(image_path)
-    win = f"{index}/{total} - {name}" if index and total else "draw boxes -- " + name
-    # Resizable window (drag border to enlarge/zoom); mouse coords stay in image
-    # pixels. Open at a screen-friendly size while keeping the buffer's detail.
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-    s0 = min(1.0, INIT_VIEW / max(vw, vh))
-    cv2.resizeWindow(win, max(1, int(vw * s0)), max(1, int(vh * s0)))
-    cv2.setMouseCallback(win, on_mouse)
-    saved = False
-    while True:
-        cv2.imshow(win, render())
-        action, state["action"] = state["action"], None
-        k = cv2.waitKey(20) & 0xFF
-        if k in (ord("s"), 13):
-            action = "save"
-        elif k in (ord("q"), 27):
-            action = "cancel"
-        elif k == ord("u"):
-            action = "undo"
-        elif k == ord("r"):
-            action = "clear"
-        if action == "save":
-            saved = True; break
-        if action == "cancel":
-            break
+    root = tk.Tk()
+    root.title(f"{index}/{total} - {name}" if index and total else "draw boxes -- " + name)
+    bar = tk.Frame(root, bg="#2d2d2d")
+    bar.pack(side="top", fill="x")
+    canvas = tk.Canvas(root, bg="#3c3c3c", highlightthickness=0, cursor="crosshair")
+    canvas.pack(side="top", fill="both", expand=True)
+
+    def act(action):
         if action == "undo" and boxes:
             boxes.pop()
-        if action == "clear":
+        elif action == "clear":
             boxes.clear()
-        if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:   # window closed
-            break
-    cv2.destroyAllWindows()
-    if not saved:
+        elif action in ("save", "cancel"):
+            result["saved"] = action == "save"
+            root.destroy()
+            return
+        redraw_boxes()
+
+    for bid, label, tip in _BUTTONS:
+        btn = tk.Button(bar, text=label, font=BUTTON_FONT, padx=14, pady=4,
+                        command=lambda a=bid: act(a))
+        btn.pack(side="left", padx=6, pady=6)
+        _Tooltip(btn, tip)
+    # open at a screen-friendly size, never narrower than the toolbar
+    root.update_idletasks()
+    bar_w, bar_h = bar.winfo_reqwidth(), bar.winfo_reqheight()
+    s0 = min(1.0, INIT_VIEW / max(vw, vh))
+    root.minsize(bar_w, bar_h + 200)
+    root.geometry(f"{max(bar_w, int(vw * s0))}x{max(400, int(vh * s0)) + bar_h}")
+
+    def to_buf(sx, sy):
+        return sx / view["z"] + view["ox"], sy / view["z"] + view["oy"]
+
+    def to_scr(bx, by):
+        return (bx - view["ox"]) * view["z"], (by - view["oy"]) * view["z"]
+
+    def clamp():
+        """Keep the image in view; centre it along an axis where it is smaller."""
+        for o, size, extent in (("ox", view["cw"], vw), ("oy", view["ch"], vh)):
+            span = size / view["z"]
+            view[o] = (extent - span) / 2 if span >= extent \
+                else min(max(view[o], 0.0), extent - span)
+
+    def fit(mode):
+        cw, ch = view["cw"], view["ch"]
+        view["z"] = cw / vw if mode == "width" else min(cw / vw, ch / vh)
+        view["ox"] = view["oy"] = 0.0
+        view["fit"] = mode
+        clamp()
+        request_render()
+
+    def zoom_at(factor, sx, sy):
+        """Zoom keeping the buffer point under screen (sx, sy) fixed."""
+        bx, by = to_buf(sx, sy)
+        lo = 0.5 * min(view["cw"] / vw, view["ch"] / vh)   # half of whole-page
+        view["z"] = min(ZOOM_MAX, max(lo, view["z"] * factor))
+        view["ox"], view["oy"] = bx - sx / view["z"], by - sy / view["z"]
+        view["fit"] = None
+        clamp()
+        request_render()
+
+    photo = {"img": None, "item": None, "pending": False}
+
+    def request_render():
+        """Redraw once the event queue is idle: a burst of wheel notches then
+        costs one redraw at the final zoom instead of one per notch."""
+        if not photo["pending"]:
+            photo["pending"] = True
+            root.after_idle(render)
+
+    def render():
+        """Redraw the visible part of the page at the current zoom."""
+        photo["pending"] = False
+        cw, ch, z = view["cw"], view["ch"], view["z"]
+        bx0, by0 = max(0.0, view["ox"]), max(0.0, view["oy"])
+        bx1, by1 = min(vw, view["ox"] + cw / z), min(vh, view["oy"] + ch / z)
+        if bx1 > bx0 and by1 > by0:
+            lvl = 0                                 # smallest copy with >= detail
+            while lvl + 1 < len(pyramid) and z * 2 ** (lvl + 1) <= 1.0:
+                lvl += 1
+            f = 2 ** lvl
+            src = pyramid[lvl]
+            ix0, iy0 = int(bx0 / f), int(by0 / f)
+            crop = src[iy0:int(np.ceil(by1 / f)), ix0:int(np.ceil(bx1 / f))]
+            tw = max(1, int(round(crop.shape[1] * z * f)))
+            th = max(1, int(round(crop.shape[0] * z * f)))
+            part = cv2.resize(crop, (tw, th), interpolation=cv2.INTER_LINEAR)
+            if ImageTk is not None:
+                photo["img"] = ImageTk.PhotoImage(Image.fromarray(part))
+            else:
+                photo["img"] = tk.PhotoImage(data=f"P6 {tw} {th} 255 ".encode()
+                                             + part.tobytes(), format="PPM")
+            sx, sy = to_scr(ix0 * f, iy0 * f)
+            pos = (int(round(sx)), int(round(sy)))
+            if photo["item"] is None:
+                photo["item"] = canvas.create_image(*pos, image=photo["img"], anchor="nw")
+                canvas.tag_lower(photo["item"])
+            else:
+                canvas.coords(photo["item"], *pos)
+                canvas.itemconfigure(photo["item"], image=photo["img"], state="normal")
+        elif photo["item"] is not None:
+            canvas.itemconfigure(photo["item"], state="hidden")
+        redraw_boxes()
+
+    def redraw_boxes():
+        canvas.delete("box")
+        for i, box in enumerate(boxes, 1):
+            x0, y0, x1, y1 = _norm(box)
+            (sx0, sy0), (sx1, sy1) = to_scr(x0, y0), to_scr(x1, y1)
+            col = "#00c800" if i - 1 == st["idx"] and st["mode"] else "#ff2020"
+            canvas.create_rectangle(sx0, sy0, sx1, sy1, outline=col, width=2, tags="box")
+            canvas.create_text(sx0 + 6, sy0 + 4, text=str(i), anchor="nw", fill=col,
+                               font=("TkDefaultFont", 13, "bold"), tags="box")
+            for cx, cy in _corners([sx0, sy0, sx1, sy1]):
+                canvas.create_rectangle(cx - _HALF, cy - _HALF, cx + _HALF, cy + _HALF,
+                                        fill="white", outline="#ff2020", tags="box")
+
+    def on_configure(ev):
+        if (ev.width, ev.height) == (view["cw"], view["ch"]):
+            return
+        view["cw"], view["ch"] = max(1, ev.width), max(1, ev.height)
+        if view["fit"]:
+            fit(view["fit"])
+        else:
+            clamp()
+            request_render()
+
+    def on_wheel(ev):
+        up = ev.num == 4 or getattr(ev, "delta", 0) > 0
+        zoom_at(ZOOM_STEP if up else 1 / ZOOM_STEP, ev.x, ev.y)
+
+    def on_press(ev):
+        bx, by = to_buf(ev.x, ev.y)
+        bx, by = max(0.0, min(bx, vw - 1.0)), max(0.0, min(by, vh - 1.0))
+        r = _GRAB / view["z"]                       # grab distance in buffer px
+        hc = _hit_corner(boxes, bx, by, r)
+        if hc is not None:
+            st.update(mode="resize", idx=hc[0], corner=hc[1])
+            return
+        he = _hit_edge(boxes, bx, by, r)            # only the border grabs a box
+        if he is not None:
+            x0, y0, _, _ = _norm(boxes[he])
+            st.update(mode="move", idx=he, off=(bx - x0, by - y0))
+            return
+        boxes.append([bx, by, bx, by])              # interior/empty -> new box
+        st.update(mode="new", idx=len(boxes) - 1)
+
+    def on_drag(ev):
+        bx, by = to_buf(ev.x, ev.y)
+        bx, by = max(0.0, min(bx, vw - 1.0)), max(0.0, min(by, vh - 1.0))
+        if st["mode"] == "new":
+            boxes[st["idx"]][2:] = [bx, by]
+        elif st["mode"] == "resize":
+            box = boxes[st["idx"]]
+            box[0 if st["corner"] in (0, 3) else 2] = bx
+            box[1 if st["corner"] in (0, 1) else 3] = by
+        elif st["mode"] == "move":
+            box = boxes[st["idx"]]
+            bw, bh = box[2] - box[0], box[3] - box[1]
+            ox, oy = st["off"]
+            nx = max(0.0, min(bx - ox, vw - 1 - bw))
+            ny = max(0.0, min(by - oy, vh - 1 - bh))
+            boxes[st["idx"]] = [nx, ny, nx + bw, ny + bh]
+        else:
+            return
+        redraw_boxes()
+
+    def on_release(_):
+        if st["mode"] in ("new", "resize", "move"):
+            i = st["idx"]
+            boxes[i] = _norm(boxes[i])
+            x0, y0, x1, y1 = boxes[i]
+            if (x1 - x0) * view["z"] <= 5 or (y1 - y0) * view["z"] <= 5:
+                boxes.pop(i)                        # discard degenerate box
+        st.update(mode=None, idx=-1, corner=-1)
+        redraw_boxes()
+
+    def on_pan_press(ev):
+        st.update(mode="pan", pan=(ev.x, ev.y, view["ox"], view["oy"]))
+
+    def on_pan_drag(ev):
+        if st["mode"] != "pan":
+            return
+        x, y, ox, oy = st["pan"]
+        view["ox"], view["oy"] = ox - (ev.x - x) / view["z"], oy - (ev.y - y) / view["z"]
+        view["fit"] = None
+        clamp()
+        request_render()
+
+    def on_pan_release(_):
+        st.update(mode=None)
+
+    canvas.bind("<Configure>", on_configure)
+    canvas.bind("<ButtonPress-1>", on_press)
+    canvas.bind("<B1-Motion>", on_drag)
+    canvas.bind("<ButtonRelease-1>", on_release)
+    for b in ("2", "3"):
+        canvas.bind(f"<ButtonPress-{b}>", on_pan_press)
+        canvas.bind(f"<B{b}-Motion>", on_pan_drag)
+        canvas.bind(f"<ButtonRelease-{b}>", on_pan_release)
+    canvas.bind("<Button-4>", on_wheel)             # X11 wheel
+    canvas.bind("<Button-5>", on_wheel)
+    canvas.bind("<MouseWheel>", on_wheel)           # Windows / macOS wheel
+    keys = {"u": lambda: act("undo"), "r": lambda: act("clear"),
+            "s": lambda: act("save"), "Return": lambda: act("save"),
+            "q": lambda: act("cancel"), "Escape": lambda: act("cancel"),
+            "f": lambda: fit("page"), "w": lambda: fit("width"),
+            "plus": lambda: zoom_at(ZOOM_STEP, view["cw"] / 2, view["ch"] / 2),
+            "equal": lambda: zoom_at(ZOOM_STEP, view["cw"] / 2, view["ch"] / 2),
+            "minus": lambda: zoom_at(1 / ZOOM_STEP, view["cw"] / 2, view["ch"] / 2)}
+    root.bind("<Key>", lambda ev: keys.get(ev.keysym, lambda: None)())
+    root.protocol("WM_DELETE_WINDOW", lambda: act("cancel"))
+    root.focus_force()
+    root.mainloop()
+
+    if not result["saved"]:
         return None
     inv = 1.0 / scale
     out = []

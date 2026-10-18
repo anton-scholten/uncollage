@@ -17,7 +17,10 @@ This toolkit has three programs:
 
 ## Requirements
 
-- Core: `opencv-python` (cv2) and `numpy`.
+- Core: `opencv-python` (cv2) and `numpy`; the box editor (`draw_boxes.py`) also
+  needs `tkinter`, part of Python's standard library (on Debian/Ubuntu:
+  `sudo apt install python3-tk` if it is missing). If `Pillow` is installed the
+  editor uses it to draw frames faster; it works without it.
 - For `sam_uncollage.py` only: `torch`, `torchvision`, `segment-anything`, and the ViT-B checkpoint `sam_vit_b_01ec64.pth` (saved as `sam_vit_b.pth`).
 
 ---
@@ -54,7 +57,7 @@ Normally none are needed.
 1. Detection runs on a copy scaled down to at most 3000 px (a 1200 dpi A4 scan is ~14000 px), which is faster and ignores film grain; boxes are mapped back to full resolution.
 2. **Background:** a smooth quadratic surface is fitted to the page's edge pixels, ignoring photos that run off the edge and dark scanner-lid strips. This handles any paper colour and lighting gradients. If no background surrounds the page (a frameless montage), the page's most frequent colour (its seams) is used instead.
 3. A pixel is background when it is smooth, close to that surface, and connected to the page border. "Close" is set from how much the page's own paper strays from the surface, so on clean scanner paper a print's off-white border still counts as part of the print. Pale areas enclosed by a photo (sky, snow) stay part of the photo.
-4. Each large foreground blob is a photo. A blob that is not rectangle-shaped (photos touching at a corner, or bridged by the shadow a thick print casts) is eroded until it falls apart into one core per photo; every pixel then goes to its nearest core, so each photo keeps its full extent. The split is kept only if every resulting piece is clearly rectangular.
+4. Each large foreground blob is a photo. A blob that is not rectangle-shaped (photos touching at a corner, or bridged by the shadow a thick print casts) is eroded until it falls apart into one core per photo; every pixel then goes to its nearest core, so each photo keeps its full extent. Photos separated by a gap too thin to survive in the mask (a few pixels of paper greyed by the prints' shadows) are cut along that straight paper-coloured line. Either split is kept only if every resulting piece is clearly rectangular.
 
 ### Manual-boxes fallback (for pages that can't be split automatically)
 
@@ -109,14 +112,17 @@ python draw_boxes.py manual_boxes.txt [--redo]      # fill uncollage.py's list
 | New box | drag on empty space (or inside another box — boxes may overlap) |
 | Resize | drag a corner handle |
 | Move | drag a box's edge |
+| Zoom | mouse wheel zooms in/out around the cursor |
+| Pan | drag with the right or middle mouse button |
 | Options | toolbar buttons **Undo / Clear / Save / Cancel** (hover for a tooltip) |
-| Keys | `u` undo · `r` clear · `s`/`Enter` save · `q`/`Esc` cancel |
+| Keys | `u` undo · `r` clear · `s`/`Enter` save · `q`/`Esc` cancel · `f` whole page · `w` fit width · `+`/`-` zoom |
 
 Because only a box's edge or corner grabs it, a drag starting inside a box makes
 a **new** box — so overlapping sub-images can each get their own box.
 
-The window is **resizable** — drag its border to enlarge it and zoom into the
-image. When processing a queue (the fallback or list mode) the title shows
+The window opens showing the **whole page** and is resizable; the toolbar stays
+put while you zoom and pan. It is a plain Tk window (Python's standard
+`tkinter`), so buttons and tooltips use the system's fonts. When processing a queue (the fallback or list mode) the title shows
 progress as `current/total - name.ext`, and the boxes file is rewritten **after
 every image**, so a crash never loses work already done.
 
