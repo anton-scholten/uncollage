@@ -3,7 +3,7 @@
 uncollage.py -- Separate scanned pages / collages into their individual photos.
 
 Usage:
-    python uncollage.py INPUT [OUTPUT] [--touching] [--debug] [--no-draw] [--manual FILE]
+    python uncollage.py INPUT [OUTPUT] [--touching] [--debug] [--jobs N] [--no-draw] [--manual FILE]
 
   INPUT   an image, a folder of images (non-recursive), or a text file listing
           one image path per line (blank lines and '#' comments ignored;
@@ -25,6 +25,8 @@ Usage:
                    folder): every page as a thumbnail with its boxes numbered
                    like the crops -- red cropped, magenta queued, green from
                    the manual file, blue drawn this run -- 12 pages a sheet.
+  --jobs N (-j N)  pages processed in parallel (default: all cores, as far as
+                   free memory allows).
   --no-draw        do not open the box editor for pages that could not be split
                    (see below); just list them in the manual-boxes file.
   --manual FILE    manual-boxes file (default manual_boxes.txt).
@@ -32,8 +34,9 @@ Usage:
 Manual-boxes fallback:
   A page whose automatic split looks failed (one page-sized blob, or a blob
   that dwarfs the rest) is queued rather than cropped. After the batch, a box
-  editor (draw_boxes.py) opens for each queued page: drag one rough box per
-  photo (s/Enter save, q/Esc skip). The boxes are cached in the manual-boxes
+  editor (draw_boxes.py) opens for each queued page, starting from the boxes
+  detection found: adjust them (s/Enter save, q/Esc skip); every edit is kept
+  in <manual file>.draft until saved, so an interrupted session loses nothing. The boxes are cached in the manual-boxes
   file, so a later run reuses them. Without a display (or with --no-draw) the
   pages are only listed there; draw them later with
   `python draw_boxes.py manual_boxes.txt` and re-run.
@@ -70,9 +73,11 @@ Requires: opencv-python (cv2), numpy.
 """
 
 import argparse
+import multiprocessing
 import os
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor
 
 import cv2
 import numpy as np
@@ -89,12 +94,15 @@ TEXTURE_TOL = 12.0       # max local std-dev to be "background" (smooth)
 FILL_RATIO_MIN = 0.55    # blob area / its rotated-bounding-rect area (rejects
                          # thin frames / speckle; a real photo is a full quad)
 KEEP_AREA_FRAC = 0.05    # ... but a blob this large is kept whatever its shape
+SLIVER_RATIO = 1 / 8     # a blob thinner than this x its length is not a photo
+MERGE_OVERLAP = 0.30     # boxes overlapping more than this x the smaller merge
 SPLIT_FILL = 0.95        # a blob filling its rotated rect less than this may be
 SPLIT_PIECE_FILL = 0.85  # ... and is cut only into pieces at least this rectangular
 SPLIT_KERNELS = (0.01, 0.02, 0.04, 0.08)  # touching photos: tried opening sizes (x page)
 PAPER_SEAM_K = 3.0       # thin paper gap filled in by the mask: pixels within
 PAPER_SEAM_MIN = 0.90    # this x tol of the paper over >= this of a line ...
 PAPER_SEAM_CONTRAST = 0.40  # ... and this much more paper-like than just beside it
+EDGE_LINE = 0.01         # lines thinner than this (x page) along its border are dropped
 WORK_MAX = 3000          # detection runs on a copy downscaled to this long side
                          # (high-dpi scans: faster, less grain; boxes scaled back)
 BOX_PAD = 0.003          # crop boxes grow by this fraction of the page's long
@@ -120,6 +128,8 @@ MANUAL_SPAN = 0.80          # a box spanning >= this of BOTH page dims is checke
                             # for a straight seam (several butted photos)
 MANUAL_DOMINANT_AREA = 0.55 # a box >= this fraction of the page that runs to 3
                             # page edges, or that is ...
+MANUAL_SOLIDITY = 0.95     # ... unless that box's blob is this solid (a clean
+                            # photo pushed into a corner of the scanner)
 MANUAL_DOMINANT_RATIO = 3.0 # ... >= this x the next largest => it merged some
 # --- Straight-line composition split ------------------------------------------
 LINE_COV_THRESH = 0.80   # a full-span content boundary crosses >= this of the box
@@ -264,6 +274,18 @@ def foreground_mask(img):
     k = max(3, int(round(min(h, w) * 0.004)) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # Scanner-edge lines: thin dark lines along the page border would join a
+    # photo touching the edge and stretch its box to the page corner. Within a
+    # band along the border, drop anything thinner than EDGE_LINE of the page.
+    b = max(3, int(EDGE_LINE * min(h, w)))
+    # (outside the image counts as background, or a line at the very edge
+    # would look twice as thick)
+    thick = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((b | 1, b | 1), np.uint8),
+                             borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    band = np.zeros_like(fg, bool)
+    band[:b], band[-b:], band[:, :b], band[:, -b:] = True, True, True, True
+    fg[band] = thick[band]
     return fg, field, tol
 
 
@@ -480,6 +502,9 @@ def _blob_to_box(blob, keep_area):
     # losing them.
     if c is None or (fill < FILL_RATIO_MIN and cv2.countNonZero(blob) < keep_area):
         return None
+    (_, _), (rw, rh), _ = cv2.minAreaRect(c)
+    if min(rw, rh) < SLIVER_RATIO * max(rw, rh):
+        return None              # a long thin strip (scanner-edge shading), no photo
     # Upright bounding box keeps the sub-image in its original orientation
     # (no de-skewing), as required.
     return cv2.boundingRect(c)
@@ -624,7 +649,7 @@ def _split_blob_by_lines(img, blob, min_area, depth=0):
             for out in _split_blob_by_lines(img, pb, min_area, depth + 1)]
 
 
-def find_subimages(img, rectangular=False, split_lines=False):
+def find_subimages(img, rectangular=False, split_lines=False, info=None):
     """Return a list of (x, y, w, h) upright crop boxes, one per sub-image.
 
     img may be any image cv2 reads (grey, alpha, 16-bit). Detection runs on an
@@ -635,6 +660,8 @@ def find_subimages(img, rectangular=False, split_lines=False):
     rectangular: also guillotine-split blobs along straight background/shadow
     seams (_split_rectangular). split_lines: also split blobs along full-span
     straight print edges (_split_blob_by_lines). The CLI's --touching sets both.
+    With an `info` dict, info["solidity"] receives each box's blob solidity
+    (area / convex-hull area), in box order -- used by _needs_manual.
     """
     H, W = img.shape[:2]
     img = _to_bgr8(img)
@@ -671,9 +698,53 @@ def find_subimages(img, rectangular=False, split_lines=False):
                  for piece in _split_blob_by_lines(img, blob, min_area)]
 
     keep = KEEP_AREA_FRAC * h * w
-    boxes = [box for box in (_blob_to_box(b, keep) for b in blobs) if box is not None]
+    found = [(box, b) for box, b in ((_blob_to_box(b, keep), b) for b in blobs)
+             if box is not None]
     pad = BOX_PAD * max(H, W)
-    return _order_boxes([_full_res_box(b, scale, pad, W, H) for b in boxes])
+    full = _merge_overlaps([(_full_res_box(box, scale, pad, W, H), _solidity(b))
+                            for box, b in found])
+    boxes = _order_boxes([bx for bx, _ in full])
+    if info is not None:
+        sol_of = dict(full)
+        info["solidity"] = [sol_of[bx] for bx in boxes]
+    return boxes
+
+
+def _merge_overlaps(items):
+    """Merge boxes that overlap by more than MERGE_OVERLAP of the smaller one
+    into their union. Separate photos overlap only by the crop margin or a
+    tilted corner; a big overlap means two pieces of one photo (a pale
+    portrait that fell apart, a mount border around its picture). items are
+    (box, solidity); a merged box keeps the higher solidity."""
+    items = list(items)
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                (a, sa), (b, sb) = items[i], items[j]
+                ix = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+                iy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+                if ix > 0 and iy > 0 and \
+                        ix * iy > MERGE_OVERLAP * min(a[2] * a[3], b[2] * b[3]):
+                    x0, y0 = min(a[0], b[0]), min(a[1], b[1])
+                    x1 = max(a[0] + a[2], b[0] + b[2])
+                    y1 = max(a[1] + a[3], b[1] + b[3])
+                    items[i] = ((x0, y0, x1 - x0, y1 - y0), max(sa, sb))
+                    del items[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    return items
+
+
+def _solidity(blob):
+    """Blob area / its convex hull's area: ~1 for a photo (even a torn or
+    tilted one), clearly less for several photos merged into one blob."""
+    _, c = _rect_fill(blob)
+    hull = cv2.contourArea(cv2.convexHull(c)) if c is not None else 0
+    return cv2.contourArea(c) / hull if hull else 0.0
 
 
 def _to_bgr8(img):
@@ -713,12 +784,22 @@ def _order_boxes(boxes):
     return [b for row in rows for b in sorted(row, key=lambda b: b[0])]
 
 
-def _needs_manual(img, boxes):
+def split_page(img, rectangular=False, split_lines=False):
+    """(boxes, queued): the crop boxes and whether the page should go to the
+    manual-boxes fallback instead -- exactly what uncollage.py decides."""
+    info = {}
+    boxes = find_subimages(img, rectangular=rectangular, split_lines=split_lines, info=info)
+    return boxes, _needs_manual(img, boxes, info["solidity"])
+
+
+def _needs_manual(img, boxes, solidity=None):
     """True when the automatic split most likely failed and the page should be
     handed off to manual boxing. Catches the common failure -- touching / faded
     photos that merge into one blob spanning the page edge to edge -- and the
     empty result. One large photo with paper visible around it is fine --
-    unless a full-span straight print edge runs across it (_looks_butted)."""
+    unless a full-span straight print edge runs across it (_looks_butted) --
+    and so is a clean photo pushed into a corner of the scanner (given
+    `solidity`, the boxes' blob solidity from find_subimages)."""
     h, w = img.shape[:2]
     page = h * w
     if not boxes:
@@ -727,8 +808,12 @@ def _needs_manual(img, boxes):
     x, y, big_w, big_h = max(boxes, key=lambda b: b[2] * b[3])
     near = 2 * BOX_PAD * max(h, w) + 2         # padding may push a box to the edge
     edges = (x <= near) + (y <= near) + (x + big_w >= w - near) + (y + big_h >= h - near)
-    if edges >= 3 and areas[0] >= MANUAL_DOMINANT_AREA * page:
-        return True            # a big box runs to the page edges -> merged/failed
+    big_sol = solidity[boxes.index((x, y, big_w, big_h))] if solidity else 0.0
+    if edges == 4 and big_w >= MANUAL_SPAN * w and big_h >= MANUAL_SPAN * h:
+        return True            # the whole page came out as foreground -> failed
+    if edges >= 3 and areas[0] >= MANUAL_DOMINANT_AREA * page \
+            and big_sol < MANUAL_SOLIDITY:
+        return True            # a big irregular box runs to the page edges -> merged
     if big_w >= MANUAL_SPAN * w and big_h >= MANUAL_SPAN * h \
             and _looks_butted(img, (x, y, big_w, big_h)):
         return True            # one photo-sized box, but really several butted
@@ -782,12 +867,48 @@ def _write_crops(path, img, boxes, out_dir=None):
         if crop.ndim == 3 and crop.shape[2] == 3 and \
                 (crop[..., 0] == crop[..., 1]).all() and (crop[..., 1] == crop[..., 2]).all():
             crop = crop[..., 0]
-        if x1 > x0 and y1 > y0 and cv2.imwrite(out, crop, params):
+        try:
+            ok = x1 > x0 and y1 > y0 and cv2.imwrite(out, crop, params)
+        except cv2.error:                       # some write failures raise instead
+            ok = False
+        if ok:
             count += 1
             print(f"  wrote {out}  ({x1 - x0}x{y1 - y0})")
         else:
             print(f"  [skip] could not write: {out}")
     return count
+
+
+def _process_one(path, rectangular, split_lines, cached, check, out_dir, want_tile):
+    """Do one page's work without touching shared state, so it can run in a
+    worker process. Returns {"count", "queued", "boxes", "tile"}: crops
+    written (and "failed": crops that could not be written), whether the page
+    needs manual boxes, the boxes used or detected,
+    and (want_tile) its debug contact-sheet cell."""
+    res = {"count": 0, "failed": 0, "queued": False, "boxes": [], "tile": None}
+    img = read_image(path)
+    if img is None:
+        print(f"  [skip] could not read image: {path}")
+        return res
+    if cached:
+        boxes = _order_boxes(list(cached))
+        print(f"  using {len(boxes)} manual box(es)")
+        status = "manual"
+    else:
+        boxes, queued = split_page(img, rectangular, split_lines)
+        status = "queued" if check and queued else "auto"
+    res["boxes"] = boxes
+    if want_tile:
+        res["tile"] = _debug_tile(path, img, boxes, status)
+    if status == "queued":
+        print("  [manual] automatic split looks merged/failed -- queued for boxing")
+        res["queued"] = True
+        return res
+    res["count"] = _write_crops(path, img, boxes, out_dir)
+    res["failed"] = len(boxes) - res["count"]
+    if res["count"] == 0:
+        print(f"  no sub-images found in {path}")
+    return res
 
 
 def process_image(path, rectangular=False, split_lines=False,
@@ -798,43 +919,55 @@ def process_image(path, rectangular=False, split_lines=False,
       * if the cache already holds hand-drawn boxes for this image, they are used
         directly and the automatic detector is bypassed;
       * otherwise the detector runs, and if its result looks merged/failed the
-        image is queued (no crops written yet); main() draws boxes for the whole
-        queue after the batch.
+        image is queued (no crops written yet) with the boxes it did find, as
+        the editor's starting point; main() draws boxes for the whole queue
+        after the batch.
     Crops are written to out_dir if given, else next to the source. With a
     `debug` dict, a thumbnail of the page and its boxes is added to it for the
     contact sheets (see _debug_tile).
     """
-    img = read_image(path)
-    if img is None:
-        print(f"  [skip] could not read image: {path}")
-        return 0
+    cached = manual["entries"].get(os.path.abspath(path)) if manual is not None else None
+    res = _process_one(path, rectangular, split_lines, cached, manual is not None,
+                       out_dir, debug is not None)
+    _record(path, res, manual, debug)
+    return res["count"]
 
+
+def _record(path, res, manual, debug):
+    """Merge one page's result into the shared manual / debug state."""
     ap = os.path.abspath(path)
-    cached = manual["entries"].get(ap) if manual is not None else None
-    if cached:
-        boxes = _order_boxes(list(cached))
-        print(f"  using {len(boxes)} manual box(es) from {os.path.basename(manual['path'])}")
-        if debug is not None:
-            debug[ap] = _debug_tile(path, img, boxes, "manual")
-        return _write_crops(path, img, boxes, out_dir)
-
-    boxes = find_subimages(img, rectangular=rectangular, split_lines=split_lines)
-
-    if manual is not None and _needs_manual(img, boxes):
+    if res["queued"] and manual is not None:
         manual["entries"].setdefault(ap, None)
+        manual.setdefault("detected", {})[ap] = res["boxes"]
         if path not in manual["pending"]:
             manual["pending"].append(path)
-        print("  [manual] automatic split looks merged/failed -- queued for boxing")
-        if debug is not None:
-            debug[ap] = _debug_tile(path, img, boxes, "queued")
-        return 0
+    if debug is not None and res["tile"] is not None:
+        debug[ap] = res["tile"]
 
-    if debug is not None:
-        debug[ap] = _debug_tile(path, img, boxes, "auto")
-    count = _write_crops(path, img, boxes, out_dir)
-    if count == 0:
-        print(f"  no sub-images found in {path}")
-    return count
+
+def _worker_init():
+    """Each worker process takes one core; OpenCV's own threads would only
+    compete with the other workers."""
+    cv2.setNumThreads(1)
+
+
+def _process_job(job):
+    path, kw = job
+    print(f"processing {path}", flush=True)
+    return _process_one(path, **kw)
+
+
+def _default_jobs():
+    """All cores, but no more workers than free memory allows (a 1200 dpi
+    page needs about 1.5 GB at peak)."""
+    jobs = os.cpu_count() or 1
+    try:
+        with open("/proc/meminfo") as f:
+            avail = next(int(l.split()[1]) for l in f if l.startswith("MemAvailable"))
+        jobs = min(jobs, max(1, int(avail / (1.5 * 1024 ** 2))))
+    except (OSError, StopIteration, ValueError):
+        pass
+    return jobs
 
 
 def _load_manual(manual_path):
@@ -842,10 +975,11 @@ def _load_manual(manual_path):
        entries -- {abs image path: [(x, y, w, h), ...] or None}, order preserved;
                   a list means "use these boxes", None means "still needs boxes",
        pending -- images queued for drawing this run (as given on the command),
+       detected -- {abs path: boxes found} for queued images (editor start),
        path    -- the file's path.
     A line is "IMAGE" (needs boxes) or "IMAGE x y w h [x y w h ...]".
     """
-    ctx = {"entries": {}, "pending": [], "path": manual_path}
+    ctx = {"entries": {}, "pending": [], "detected": {}, "path": manual_path}
     if manual_path and os.path.exists(manual_path):
         with open(manual_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -891,19 +1025,23 @@ def _has_display():
 
 def _draw_and_crop(path, manual, draw_mod, out_dir=None, index=None, total=None,
                    debug=None):
-    """Open the box editor for one queued image and crop from what is drawn."""
+    """Open the box editor for one queued image and crop from what is drawn.
+    Returns (crops written, crops that could not be written)."""
     print(f"\n  draw boxes for {path}  "
-          "(drag one box per photo; s/Enter=save, q/Esc=skip)")
-    boxes = draw_mod.draw(path, index, total)
+          "(adjust the boxes; s/Enter=save, q/Esc=skip)")
+    boxes = draw_mod.draw(path, index, total,
+                          initial=manual.get("detected", {}).get(os.path.abspath(path)),
+                          draft_file=manual["path"] + ".draft")
     if not boxes:
         print("  [manual] skipped -- still needs boxes")
-        return 0
+        return 0, 0
     img = read_image(path)
     boxes = _order_boxes(list(boxes))
     manual["entries"][os.path.abspath(path)] = boxes
     if debug is not None:
         debug[os.path.abspath(path)] = _debug_tile(path, img, boxes, "drawn")
-    return _write_crops(path, img, boxes, out_dir)
+    n = _write_crops(path, img, boxes, out_dir)
+    return n, len(boxes) - n
 
 
 def _debug_tile(path, img, boxes, status):
@@ -1016,6 +1154,9 @@ def main(argv):
                     help="do not open the box editor for failed pages")
     ap.add_argument("--manual", default=MANUAL_FILE_DEFAULT, metavar="FILE",
                     help="manual-boxes file (default %(default)s)")
+    ap.add_argument("-j", "--jobs", type=int, default=0, metavar="N",
+                    help="pages processed in parallel (default: all cores, "
+                         "as far as free memory allows)")
     ap.add_argument("-d", "--debug", action="store_true",
                     help=f"also write contact sheets of every page and its boxes "
                          f"into {DEBUG_DIR}/ in the output folder")
@@ -1031,13 +1172,26 @@ def main(argv):
     manual = _load_manual(manual_path)
     debug = {} if opt.debug else None
 
-    # Pass 1: process every image; failures are queued in manual["pending"].
-    total = 0
-    for img_path in iter_input_paths(in_path):
-        print(f"processing {img_path}")
-        total += process_image(img_path, rectangular=opt.touching,
-                               split_lines=opt.touching, manual=manual, out_dir=out_dir,
-                               debug=debug)
+    # Pass 1: process every image, several at once; failures are queued in
+    # manual["pending"] (in input order).
+    paths = list(iter_input_paths(in_path))
+    kw = dict(rectangular=opt.touching, split_lines=opt.touching, check=True,
+              out_dir=out_dir, want_tile=debug is not None)
+    jobs = [(p, dict(kw, cached=manual["entries"].get(os.path.abspath(p)))) for p in paths]
+    n_jobs = min(len(jobs), opt.jobs if opt.jobs > 0 else _default_jobs())
+    if n_jobs > 1:
+        # "spawn": forking a process whose OpenCV thread pool is running can
+        # deadlock the children
+        with ProcessPoolExecutor(n_jobs, mp_context=multiprocessing.get_context("spawn"),
+                                 initializer=_worker_init) as ex:
+            results = list(ex.map(_process_job, jobs))
+    else:
+        results = [_process_job(job) for job in jobs]
+    total = failed = 0
+    for p, res in zip(paths, results):
+        _record(p, res, manual, debug)
+        total += res["count"]
+        failed += res["failed"]
 
     # Pass 2: draw boxes for the queued failures, then crop them.
     queued = list(manual["pending"])
@@ -1053,8 +1207,9 @@ def main(argv):
                   "editor for each...")
             nq = len(queued)
             for k, img_path in enumerate(queued, 1):
-                total += _draw_and_crop(img_path, manual, draw_boxes, out_dir, k, nq,
-                                        debug=debug)
+                n, nf = _draw_and_crop(img_path, manual, draw_boxes, out_dir, k, nq,
+                                       debug=debug)
+                total, failed = total + n, failed + nf
                 _save_manual(manual)    # persist after each crop, in case of a crash
 
     _save_manual(manual)
@@ -1072,6 +1227,9 @@ def main(argv):
     # Anything still without boxes (skipped in the editor, --no-draw, or headless).
     pending_left = [ap for ap, b in manual["entries"].items() if not b]
     print(f"\ndone: {total} sub-image(s) written")
+    if failed:
+        print(f"ERROR: {failed} crop(s) could not be written (disk full or no write "
+              f"permission?) -- see the [skip] lines above; re-run once fixed.")
     if pending_left and (no_draw or not _has_display()):
         print(f"{len(pending_left)} page(s) still need manual boxes -> {manual_path}\n"
               f"  draw them: python draw_boxes.py {manual_path}\n"
@@ -1079,7 +1237,7 @@ def main(argv):
     elif pending_left:
         print(f"{len(pending_left)} page(s) were skipped and still need boxes "
               f"(listed in {manual_path}).")
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

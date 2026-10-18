@@ -61,8 +61,8 @@ TRUTH = {
 
 
 def _outcome(img):
-    boxes = uncollage.find_subimages(img)
-    return "queued" if uncollage._needs_manual(img, boxes) else len(boxes)
+    boxes, queued = uncollage.split_page(img)
+    return "queued" if queued else len(boxes)
 
 
 def _have_pool():

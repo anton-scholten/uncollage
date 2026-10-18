@@ -33,7 +33,8 @@ python uncollage.py INPUT [OUTPUT]
   skipped) or a text file with one image path per line.
 - `OUTPUT`: folder for the crops; default is next to each source.
 
-Crops are named `<image>_1`, `<image>_2`, … row by row, left to right. A
+Crops are named `<image>_1`, `<image>_2`, … row by row, left to right; a
+re-run overwrites crops of the same name. A
 lossless source keeps its format; JPEG/WebP crops are saved as PNG, since
 re-encoding would change pixels. Crops whose colour channels are identical are
 saved as one-channel grey (same values, a third of the size). EXIF orientation
@@ -43,6 +44,7 @@ is not applied.
 |---|---|
 | `-t`, `--touching` | Also cut photos butted together with **no** gap (straight shadow seams and print edges). Off by default: it can cut a photo along its own straight horizon. |
 | `-d`, `--debug` | Write contact sheets into `uncollage_debug/` in the output folder: every page with its numbered boxes, 12 per sheet. Red = cropped, magenta = queued, green = from the manual file, blue = drawn this run. |
+| `-j N`, `--jobs N` | Pages processed in parallel (default: all cores, as free memory allows; ~3.5x faster on 6 cores). |
 | `--no-draw` | Don't open the editor; just list failed pages in the manual file. |
 | `--manual FILE` | Manual-boxes file (default `manual_boxes.txt`). |
 
@@ -55,8 +57,9 @@ python uncollage.py montages/ crops/ -t   # butted composites
 ### Pages it can't split
 
 A page whose result looks merged or empty is queued instead of cropped. After
-the batch the editor opens for each queued page; the boxes you draw are cropped
-right away and cached in the manual-boxes file, so later runs reuse them.
+the batch the editor opens for each queued page, showing the boxes detection
+found so you can just adjust them; they are cropped right away and cached in
+the manual-boxes file, so later runs reuse them.
 Without a display (or with `--no-draw`), draw them later:
 
 ```
@@ -94,8 +97,11 @@ python draw_boxes.py manual_boxes.txt [--redo]    # draw the pages uncollage.py 
 | Buttons | **Undo · Clear · Save · Cancel** (hover for a tooltip) |
 | Keys | `u` undo · `r` clear · `s`/`Enter` save · `q`/`Esc` cancel · `f` whole page · `w` fit width · `+`/`-` zoom |
 
-The window opens on the whole page. In list mode the file is saved after every
-image.
+The window opens centred, showing the whole page with a margin of background,
+so a box around the whole page can start outside it. It starts with the boxes
+automatic detection finds (one around the whole image if none). Every edit is
+saved at once to `<boxes file>.draft`, so an interrupted session (Ctrl+C, closed
+window) loses nothing and is offered again next time; Save or Cancel clears it.
 
 ---
 

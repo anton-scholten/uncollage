@@ -39,9 +39,9 @@ def test_scenarios_match_expected():
     """Each scenario yields its expected count (or queues) with its flags."""
     for name, build, flags, expected, needs_manual in SCENARIOS:
         img = build()
-        boxes = uncollage.find_subimages(img, **flags)
+        boxes, queued = uncollage.split_page(img, **flags)
         if needs_manual:
-            assert uncollage._needs_manual(img, boxes), \
+            assert queued, \
                 f"{name}: expected the page to be queued for manual boxing"
         else:
             assert len(boxes) == expected, \
@@ -55,7 +55,7 @@ def test_flags_drive_the_split():
     # grid & composite: plain mode leaves a page-spanning merge -> manual, not N
     for build in (gen_collages.grid, gen_collages.composite):
         img = build()
-        assert uncollage._needs_manual(img, uncollage.find_subimages(img))
+        assert uncollage.split_page(img)[1]
     # line-splitter must NOT over-split cleanly separated photos
     assert _count(gen_collages.separated(), {"split_lines": True}) == 4
 
@@ -149,6 +149,16 @@ def _debug_sheets_ok():
     return len(paths) == 2 and all(os.path.exists(p) for p in paths)
 
 
+def _corner_box_tight():
+    """The scanner-edge line does not stretch the corner photo's box."""
+    boxes = uncollage.find_subimages(gen_collages.scanner_corner())
+    return len(boxes) == 1 and boxes[0][2] < 900               # photo is 820 wide
+
+
+def test_corner_box_tight():
+    assert _corner_box_tight()
+
+
 def test_order_boxes():
     assert _order_ok()
 
@@ -175,8 +185,8 @@ def _main():
     rows, ok = [], True
     for name, build, flags, expected, needs_manual in SCENARIOS:
         img = build()
-        boxes = uncollage.find_subimages(img, **flags)
-        got = "queued" if uncollage._needs_manual(img, boxes) else len(boxes)
+        boxes, queued = uncollage.split_page(img, **flags)
+        got = "queued" if queued else len(boxes)
         want = "queued" if needs_manual else expected
         passed = (got == want)
         ok &= passed
@@ -196,6 +206,7 @@ def _main():
     check("box holds photo", _boxes_contain_photos())
     check("grey crop 1-ch", _grey_crops_one_channel())
     check("crop numbering", _order_ok())
+    check("edge line ignored", _corner_box_tight())
     check("debug sheets", _debug_sheets_ok())
 
     w = max(len(r[0]) for r in rows)

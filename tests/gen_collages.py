@@ -230,6 +230,18 @@ def thin_gap(tile=_photo):
     return page
 
 
+def scanner_corner(tile=_photo):
+    """1 photo pushed into the scanner's corner (touching three page edges),
+    with the thin dark line a scanner leaves along the top edge -> cropped as 1
+    without being queued, and the line does not stretch the box."""
+    rng = np.random.default_rng(11)
+    H, W = 800, 1100
+    page = _paper_bg(rng, H, W)
+    page[:, :820] = tile(rng, H, 820)
+    page[:4] = 25                                            # scanner-edge line
+    return page
+
+
 # name, builder, uncollage flags, expected sub-image count, needs-manual?
 SCENARIOS = [
     ("separated", separated, {}, 4, False),
@@ -242,6 +254,7 @@ SCENARIOS = [
     ("dark", dark, {}, 3, False),
     ("corner", corner, {}, 2, False),
     ("thin_gap", thin_gap, {}, 2, False),
+    ("scanner_corner", scanner_corner, {}, 1, False),
 ]
 
 

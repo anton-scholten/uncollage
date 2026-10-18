@@ -31,8 +31,8 @@ from gen_collages_real import SCENARIOS_REAL, OLD_TRUTH
 
 
 def _result(img, flags):
-    boxes = uncollage.find_subimages(img, **flags)
-    return "queued" if uncollage._needs_manual(img, boxes) else len(boxes)
+    boxes, queued = uncollage.split_page(img, **flags)
+    return "queued" if queued else len(boxes)
 
 
 # --- pytest-style tests -------------------------------------------------------

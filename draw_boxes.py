@@ -31,6 +31,11 @@ Controls (in the window):
     keys                   u=undo  r=clear  s/Enter=save  q/Esc=cancel
                            f=whole page  w=fit width  +/-=zoom
 
+The boxes automatic detection finds are shown to start with (one box around
+the whole image if it finds none), so usually you only adjust them. Every edit
+is saved at once to a draft file next to the boxes file (`<file>.draft`), so an
+interrupted session loses nothing; the draft is offered again next time.
+
 Overlapping boxes are supported: because only a box's edge (or corner) grabs it,
 a drag that starts inside a box makes a new box instead of moving the old one,
 so overlapping sub-images can each get their own box.
@@ -61,12 +66,14 @@ MAX_VIEW = 3000          # working buffer long side: the detail available when z
 INIT_VIEW = 950          # initial window long side (fits a laptop screen)
 ZOOM_STEP = 1.2          # zoom factor per wheel notch
 ZOOM_MAX = 8.0           # max screen px per buffer px
-BUTTON_FONT = ("TkDefaultFont", 24)
+BUTTON_FONT = ("TkDefaultFont", 12)
 TIP_FONT = ("TkDefaultFont", 12)
 TIP_DX, TIP_DY = 40, 24  # tooltip offset from the cursor (clear of a big cursor)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-_GRAB = 10               # how close (screen px) the cursor must be to grab a corner
-_HALF = 4                # half-size of a drawn corner handle
+_GRAB = 16               # how close (screen px) the cursor must be to grab a corner
+_HALF = 8                # half-size of a drawn corner handle
+MARGIN = 40              # screen px of background kept around the page, so a box
+                         # around the whole page can start outside it
 
 # The only options the window needs: id, label, and the hover tooltip text.
 _BUTTONS = [
@@ -141,7 +148,41 @@ class _Tooltip:
             self.win = None
 
 
-def draw(image_path, index=None, total=None):
+def _load_drafts(path):
+    """{image path: [(x, y, w, h), ...]} from a draft file ("PATH x y w h ...")."""
+    drafts = {}
+    if path and os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            parts = line.split()
+            if len(parts) >= 1 and (len(parts) - 1) % 4 == 0:
+                nums = [int(round(float(v))) for v in parts[1:]]
+                drafts[parts[0]] = [tuple(nums[i:i + 4]) for i in range(0, len(nums), 4)]
+    return drafts
+
+
+def _save_draft(path, image_path, boxes):
+    """Record (boxes) or drop (None) one image's unsaved boxes in the draft file.
+    Written to a temp file and renamed, so an interrupt never leaves it torn."""
+    if not path:
+        return
+    key = os.path.abspath(image_path)
+    drafts = _load_drafts(path)
+    if boxes is None:
+        drafts.pop(key, None)
+    else:
+        drafts[key] = boxes
+    if not drafts:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for k, bs in drafts.items():
+            f.write(k + "".join(f" {x} {y} {w} {h}" for x, y, w, h in bs) + "\n")
+    os.replace(tmp, path)
+
+
+def draw(image_path, index=None, total=None, initial=None, draft_file=None):
     """Open a window to draw/edit one box per photo. Returns [(x,y,w,h), ...] in
     source pixels on save, or None if cancelled. When `index`/`total` are given
     the title is "index/total - name.ext".
@@ -155,6 +196,12 @@ def draw(image_path, index=None, total=None):
     new (possibly overlapping) box -- letting overlapping sub-images each get one.
     The toolbar buttons (Undo / Clear / Save / Cancel) show a tooltip on hover;
     the same actions are on u / r / Enter / Esc.
+
+    `initial` boxes (source pixels, e.g. what automatic detection found) are
+    shown ready to adjust; with none, one box around the whole image. With a
+    `draft_file`, every edit is written there at once, so boxes survive an
+    interrupted session (Ctrl+C, closed window) and are offered again next
+    time; Save or Cancel removes the image's draft.
     """
     img = cv2.imread(image_path, cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
     if img is None:
@@ -174,7 +221,24 @@ def draw(image_path, index=None, total=None):
         pyramid.append(cv2.resize(pyramid[-1], None, fx=0.5, fy=0.5,
                                   interpolation=cv2.INTER_AREA))
 
-    boxes = []               # each a [x0, y0, x1, y1] in BUFFER coords
+    # each a [x0, y0, x1, y1] in BUFFER coords: an unsaved draft first, else
+    # the given boxes, else one box around the whole image
+    start = _load_drafts(draft_file).get(os.path.abspath(image_path)) or initial \
+        or [(0, 0, w, h)]
+    boxes = [[min(float(vw), x * scale), min(float(vh), y * scale),
+              min(float(vw), (x + bw) * scale), min(float(vh), (y + bh) * scale)]
+             for x, y, bw, bh in start]
+
+    def source_boxes():
+        inv, out = 1.0 / scale, []
+        for x0, y0, x1, y1 in (_norm(b) for b in boxes):
+            sx0, sy0 = int(round(x0 * inv)), int(round(y0 * inv))
+            sx1, sy1 = min(w, int(round(x1 * inv))), min(h, int(round(y1 * inv)))
+            out.append((sx0, sy0, sx1 - sx0, sy1 - sy0))
+        return out
+
+    def autosave():
+        _save_draft(draft_file, image_path, source_boxes())
     # mode: None | 'new' | 'resize' | 'move' | 'pan'
     st = {"mode": None, "idx": -1, "corner": -1, "off": (0, 0), "pan": (0, 0, 0, 0)}
     # view: z = screen px per buffer px; (ox, oy) = buffer point at the
@@ -195,10 +259,14 @@ def draw(image_path, index=None, total=None):
             boxes.pop()
         elif action == "clear":
             boxes.clear()
-        elif action in ("save", "cancel"):
+        elif action in ("save", "cancel", "close"):
             result["saved"] = action == "save"
+            result["boxes"] = source_boxes()
+            if action != "close":                # closing the window keeps the
+                _save_draft(draft_file, image_path, None)  # draft for next time
             root.destroy()
             return
+        autosave()
         redraw_boxes()
 
     for bid, label, tip in _BUTTONS:
@@ -211,7 +279,10 @@ def draw(image_path, index=None, total=None):
     bar_w, bar_h = bar.winfo_reqwidth(), bar.winfo_reqheight()
     s0 = min(1.0, INIT_VIEW / max(vw, vh))
     root.minsize(bar_w, bar_h + 200)
-    root.geometry(f"{max(bar_w, int(vw * s0))}x{max(400, int(vh * s0)) + bar_h}")
+    ww = max(bar_w, int(vw * s0) + 2 * MARGIN)
+    wh = max(400, int(vh * s0) + 2 * MARGIN) + bar_h
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f"{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2)}")
 
     def to_buf(sx, sy):
         return sx / view["z"] + view["ox"], sy / view["z"] + view["oy"]
@@ -220,16 +291,18 @@ def draw(image_path, index=None, total=None):
         return (bx - view["ox"]) * view["z"], (by - view["oy"]) * view["z"]
 
     def clamp():
-        """Keep the image in view; centre it along an axis where it is smaller."""
+        """Keep the image in view, allowing MARGIN px of background beyond its
+        edges; centre it along an axis where it is smaller than the window."""
+        m = MARGIN / view["z"]
         for o, size, extent in (("ox", view["cw"], vw), ("oy", view["ch"], vh)):
             span = size / view["z"]
-            view[o] = (extent - span) / 2 if span >= extent \
-                else min(max(view[o], 0.0), extent - span)
+            view[o] = (extent - span) / 2 if span >= extent + 2 * m \
+                else min(max(view[o], -m), extent - span + m)
 
     def fit(mode):
-        cw, ch = view["cw"], view["ch"]
+        cw, ch = max(1, view["cw"] - 2 * MARGIN), max(1, view["ch"] - 2 * MARGIN)
         view["z"] = cw / vw if mode == "width" else min(cw / vw, ch / vh)
-        view["ox"] = view["oy"] = 0.0
+        view["ox"] = view["oy"] = -MARGIN / view["z"]
         view["fit"] = mode
         clamp()
         request_render()
@@ -316,7 +389,7 @@ def draw(image_path, index=None, total=None):
 
     def on_press(ev):
         bx, by = to_buf(ev.x, ev.y)
-        bx, by = max(0.0, min(bx, vw - 1.0)), max(0.0, min(by, vh - 1.0))
+        bx, by = max(0.0, min(bx, float(vw))), max(0.0, min(by, float(vh)))
         r = _GRAB / view["z"]                       # grab distance in buffer px
         hc = _hit_corner(boxes, bx, by, r)
         if hc is not None:
@@ -332,7 +405,7 @@ def draw(image_path, index=None, total=None):
 
     def on_drag(ev):
         bx, by = to_buf(ev.x, ev.y)
-        bx, by = max(0.0, min(bx, vw - 1.0)), max(0.0, min(by, vh - 1.0))
+        bx, by = max(0.0, min(bx, float(vw))), max(0.0, min(by, float(vh)))
         if st["mode"] == "new":
             boxes[st["idx"]][2:] = [bx, by]
         elif st["mode"] == "resize":
@@ -343,8 +416,8 @@ def draw(image_path, index=None, total=None):
             box = boxes[st["idx"]]
             bw, bh = box[2] - box[0], box[3] - box[1]
             ox, oy = st["off"]
-            nx = max(0.0, min(bx - ox, vw - 1 - bw))
-            ny = max(0.0, min(by - oy, vh - 1 - bh))
+            nx = max(0.0, min(bx - ox, vw - bw))
+            ny = max(0.0, min(by - oy, vh - bh))
             boxes[st["idx"]] = [nx, ny, nx + bw, ny + bh]
         else:
             return
@@ -357,6 +430,7 @@ def draw(image_path, index=None, total=None):
             x0, y0, x1, y1 = boxes[i]
             if (x1 - x0) * view["z"] <= 5 or (y1 - y0) * view["z"] <= 5:
                 boxes.pop(i)                        # discard degenerate box
+            autosave()
         st.update(mode=None, idx=-1, corner=-1)
         redraw_boxes()
 
@@ -394,18 +468,19 @@ def draw(image_path, index=None, total=None):
             "equal": lambda: zoom_at(ZOOM_STEP, view["cw"] / 2, view["ch"] / 2),
             "minus": lambda: zoom_at(1 / ZOOM_STEP, view["cw"] / 2, view["ch"] / 2)}
     root.bind("<Key>", lambda ev: keys.get(ev.keysym, lambda: None)())
-    root.protocol("WM_DELETE_WINDOW", lambda: act("cancel"))
+    root.protocol("WM_DELETE_WINDOW", lambda: act("close"))
     root.focus_force()
     root.mainloop()
 
-    if not result["saved"]:
-        return None
-    inv = 1.0 / scale
-    out = []
-    for x0, y0, x1, y1 in (_norm(b) for b in boxes):
-        out.append((int(round(x0 * inv)), int(round(y0 * inv)),
-                    int(round((x1 - x0) * inv)), int(round((y1 - y0) * inv))))
-    return out
+    return result["boxes"] if result["saved"] else None
+
+
+def _detected(image_path):
+    """What uncollage's automatic detection finds -- the editor's starting
+    boxes (an empty result falls back to one box around the whole image)."""
+    import uncollage
+    img = uncollage.read_image(image_path)
+    return uncollage.find_subimages(img) if img is not None else None
 
 
 def run_manual_file(list_path, redo=False):
@@ -417,6 +492,7 @@ def run_manual_file(list_path, redo=False):
         print(f"error: file not found: {list_path}")
         return 1
     base = os.path.dirname(os.path.abspath(list_path))
+    draft_file = list_path + ".draft"
     parsed = []                      # ("raw", text) | ("img", name, [num strs])
     for line in open(list_path, encoding="utf-8").read().splitlines():
         s = line.strip()
@@ -428,7 +504,7 @@ def run_manual_file(list_path, redo=False):
         has = len(nums) >= 4 and len(nums) % 4 == 0
         parsed.append(("img", parts[0], nums if has else []))
 
-    todo = [item[1] for item in parsed
+    todo = [(item[1], item[2]) for item in parsed
             if item[0] == "img" and (redo or not item[2])]
     if not todo:
         print("all listed images already have boxes (use --redo to redraw).")
@@ -455,12 +531,14 @@ def run_manual_file(list_path, redo=False):
                     f.write(name + "\n")      # skipped -> stays pending
 
     total = len(todo)
-    for k, name in enumerate(todo, 1):
+    for k, (name, existing) in enumerate(todo, 1):
         ip = name if (os.path.isabs(name) or os.path.exists(name)) \
             else os.path.join(base, name)
-        print(f"[{k}/{total}] drawing boxes for {ip}  (drag one box per photo; "
+        print(f"[{k}/{total}] drawing boxes for {ip}  (adjust the boxes; "
               "s/Enter=save, q/Esc=skip)")
-        boxes = draw(ip, k, total)
+        start = [tuple(int(round(float(v))) for v in existing[i:i + 4])
+                 for i in range(0, len(existing), 4)] if existing else _detected(ip)
+        boxes = draw(ip, k, total, initial=start, draft_file=draft_file)
         if boxes:
             results[name] = boxes
         flush()                               # persist after each image
@@ -487,7 +565,7 @@ def main(argv):
         return run_manual_file(target, redo=redo)
 
     image_path = target
-    boxes = draw(image_path)
+    boxes = draw(image_path, initial=_detected(image_path), draft_file=out + ".draft")
     if not boxes:
         print("no boxes saved.")
         return 1
