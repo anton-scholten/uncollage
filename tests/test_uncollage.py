@@ -131,6 +131,32 @@ def _boxes_contain_photos():
         for (bx, by, bw, bh), (tx, ty, tw, th) in zip(boxes, truth))
 
 
+def _order_ok():
+    """Photos side by side are numbered left-to-right even when their tops
+    differ a little; rows run top-to-bottom."""
+    boxes = [(600, 1000, 400, 500), (100, 1060, 400, 500),   # row 2, right top higher
+             (600, 40, 400, 500), (100, 0, 400, 500)]        # row 1
+    return uncollage._order_boxes(boxes) == [boxes[3], boxes[2], boxes[1], boxes[0]]
+
+
+def _debug_sheets_ok():
+    """--debug pages its cells into sheets of DEBUG_PER_SHEET."""
+    page = gen_collages.separated()
+    cell = uncollage._debug_tile("p.png", page, uncollage.find_subimages(page), "auto")
+    out = tempfile.mkdtemp()
+    n = uncollage.DEBUG_PER_SHEET + 1
+    paths = uncollage.write_debug_sheets([cell] * n, out)
+    return len(paths) == 2 and all(os.path.exists(p) for p in paths)
+
+
+def test_order_boxes():
+    assert _order_ok()
+
+
+def test_debug_sheets():
+    assert _debug_sheets_ok()
+
+
 def test_crops_pixel_identical():
     assert _crops_pixel_identical()
 
@@ -169,6 +195,8 @@ def _main():
     check("pixel-identical", _crops_pixel_identical())
     check("box holds photo", _boxes_contain_photos())
     check("grey crop 1-ch", _grey_crops_one_channel())
+    check("crop numbering", _order_ok())
+    check("debug sheets", _debug_sheets_ok())
 
     w = max(len(r[0]) for r in rows)
     print(f"{'scenario'.ljust(w)}  {'flags':<14} {'want':<8} {'got':<8} result")

@@ -3,7 +3,7 @@
 uncollage.py -- Separate scanned pages / collages into their individual photos.
 
 Usage:
-    python uncollage.py INPUT [OUTPUT] [--touching] [--no-draw] [--manual FILE]
+    python uncollage.py INPUT [OUTPUT] [--touching] [--debug] [--no-draw] [--manual FILE]
 
   INPUT   an image, a folder of images (non-recursive), or a text file listing
           one image path per line (blank lines and '#' comments ignored;
@@ -20,6 +20,11 @@ Usage:
                    (straight shadow seams and full-span straight print edges).
                    Off by default: on ordinary scans it can cut a photo along
                    its own straight horizon or edge.
+  --debug (-d)     also write contact sheets uncollage_debug_01.jpg, ... into an
+                   uncollage_debug/ subfolder of OUTPUT (or of the input's
+                   folder): every page as a thumbnail with its boxes numbered
+                   like the crops -- red cropped, magenta queued, green from
+                   the manual file, blue drawn this run -- 12 pages a sheet.
   --no-draw        do not open the box editor for pages that could not be split
                    (see below); just list them in the manual-boxes file.
   --manual FILE    manual-boxes file (default manual_boxes.txt).
@@ -92,6 +97,13 @@ BOX_PAD = 0.003          # crop boxes grow by this fraction of the page's long
 LOSSY_EXTS = {".jpg", ".jpeg", ".webp"}  # crops of these are saved as PNG
 BG_EDGE_MIN = 0.50       # paper must cover this much of the image edge
 BG_FIT_ITERS = 3         # outlier-rejecting refits of the background surface
+# --- Debug contact sheets (--debug) ---------------------------------------------
+DEBUG_DIR = "uncollage_debug"   # sheets go in this subfolder of the output
+DEBUG_CELL = 480         # each page thumbnail fits a cell this many px square
+DEBUG_COLS = 6           # cells per row ...
+DEBUG_PER_SHEET = 12     # ... and pages per sheet
+DEBUG_COLOURS = {"auto": (0, 0, 230), "manual": (0, 150, 0),   # BGR
+                 "drawn": (230, 120, 0), "queued": (230, 0, 230)}
 # --- Rectangular-mode (guillotine split) tunables -----------------------------
 SEAM_THRESH = 0.70       # min fraction of a cut line that must look like a seam
 SEAM_MIN_SPAN = 0.85     # a cut must span >= this fraction of the blob's extent
@@ -601,7 +613,7 @@ def find_subimages(img, rectangular=False, split_lines=False):
     keep = KEEP_AREA_FRAC * h * w
     boxes = [box for box in (_blob_to_box(b, keep) for b in blobs) if box is not None]
     pad = BOX_PAD * max(H, W)
-    return _order_boxes([_full_res_box(b, scale, pad, W, H) for b in boxes], H)
+    return _order_boxes([_full_res_box(b, scale, pad, W, H) for b in boxes])
 
 
 def _to_bgr8(img):
@@ -627,10 +639,18 @@ def _full_res_box(box, scale, pad, W, H):
     return (x0, y0, x1 - x0, y1 - y0)
 
 
-def _order_boxes(boxes, h):
-    """Number top-to-bottom, then left-to-right (rows quantised for stability)."""
-    row_h = max(1, h // 20)
-    return sorted(boxes, key=lambda b: (b[1] // row_h, b[0]))
+def _order_boxes(boxes):
+    """Number top-to-bottom, then left-to-right. Rows are formed by vertical
+    overlap -- a box joins the current row when its top lies above the middle
+    of that row's first box -- so photos side by side keep left-to-right
+    order even if their tops differ a little."""
+    rows = []
+    for b in sorted(boxes, key=lambda b: b[1]):
+        if rows and b[1] < rows[-1][0][1] + rows[-1][0][3] / 2:
+            rows[-1].append(b)
+        else:
+            rows.append([b])
+    return [b for row in rows for b in sorted(row, key=lambda b: b[0])]
 
 
 def _needs_manual(img, boxes):
@@ -711,7 +731,7 @@ def _write_crops(path, img, boxes, out_dir=None):
 
 
 def process_image(path, rectangular=False, split_lines=False,
-                  manual=None, out_dir=None):
+                  manual=None, out_dir=None, debug=None):
     """Extract sub-images from one image file. Returns the number written.
 
     When `manual` (a context from _load_manual) is given:
@@ -720,7 +740,9 @@ def process_image(path, rectangular=False, split_lines=False,
       * otherwise the detector runs, and if its result looks merged/failed the
         image is queued (no crops written yet); main() draws boxes for the whole
         queue after the batch.
-    Crops are written to out_dir if given, else next to the source.
+    Crops are written to out_dir if given, else next to the source. With a
+    `debug` dict, a thumbnail of the page and its boxes is added to it for the
+    contact sheets (see _debug_tile).
     """
     img = read_image(path)
     if img is None:
@@ -730,8 +752,10 @@ def process_image(path, rectangular=False, split_lines=False,
     ap = os.path.abspath(path)
     cached = manual["entries"].get(ap) if manual is not None else None
     if cached:
-        boxes = _order_boxes(list(cached), img.shape[0])
+        boxes = _order_boxes(list(cached))
         print(f"  using {len(boxes)} manual box(es) from {os.path.basename(manual['path'])}")
+        if debug is not None:
+            debug[ap] = _debug_tile(path, img, boxes, "manual")
         return _write_crops(path, img, boxes, out_dir)
 
     boxes = find_subimages(img, rectangular=rectangular, split_lines=split_lines)
@@ -741,8 +765,12 @@ def process_image(path, rectangular=False, split_lines=False,
         if path not in manual["pending"]:
             manual["pending"].append(path)
         print("  [manual] automatic split looks merged/failed -- queued for boxing")
+        if debug is not None:
+            debug[ap] = _debug_tile(path, img, boxes, "queued")
         return 0
 
+    if debug is not None:
+        debug[ap] = _debug_tile(path, img, boxes, "auto")
     count = _write_crops(path, img, boxes, out_dir)
     if count == 0:
         print(f"  no sub-images found in {path}")
@@ -801,7 +829,8 @@ def _has_display():
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _draw_and_crop(path, manual, draw_mod, out_dir=None, index=None, total=None):
+def _draw_and_crop(path, manual, draw_mod, out_dir=None, index=None, total=None,
+                   debug=None):
     """Open the box editor for one queued image and crop from what is drawn."""
     print(f"\n  draw boxes for {path}  "
           "(drag one box per photo; s/Enter=save, q/Esc=skip)")
@@ -810,9 +839,71 @@ def _draw_and_crop(path, manual, draw_mod, out_dir=None, index=None, total=None)
         print("  [manual] skipped -- still needs boxes")
         return 0
     img = read_image(path)
-    boxes = _order_boxes(list(boxes), img.shape[0])
+    boxes = _order_boxes(list(boxes))
     manual["entries"][os.path.abspath(path)] = boxes
+    if debug is not None:
+        debug[os.path.abspath(path)] = _debug_tile(path, img, boxes, "drawn")
     return _write_crops(path, img, boxes, out_dir)
+
+
+def _debug_tile(path, img, boxes, status):
+    """A contact-sheet cell for one page: its thumbnail (fitted into a
+    DEBUG_CELL square) with the boxes drawn and numbered like the crop files,
+    coloured by status (DEBUG_COLOURS), and a caption. Kept JPEG-encoded, so a
+    run over hundreds of pages stays small in memory."""
+    c = DEBUG_CELL
+    cap = 26                                       # caption strip height
+    page = _to_bgr8(img)
+    h, w = page.shape[:2]
+    s = min(c / w, (c - cap) / h)
+    thumb = cv2.resize(page, (max(1, int(w * s)), max(1, int(h * s))),
+                       interpolation=cv2.INTER_AREA)
+    cell = np.full((c, c, 3), 90, np.uint8)
+    ox, oy = (c - thumb.shape[1]) // 2, (c - cap - thumb.shape[0]) // 2
+    cell[oy:oy + thumb.shape[0], ox:ox + thumb.shape[1]] = thumb
+    col = DEBUG_COLOURS[status]
+    for i, (x, y, bw, bh) in enumerate(boxes, start=1):
+        p0 = (ox + int(x * s), oy + int(y * s))
+        p1 = (ox + int((x + bw) * s), oy + int((y + bh) * s))
+        cv2.rectangle(cell, p0, p1, col, 2)
+        cv2.putText(cell, str(i), (p0[0] + 4, p0[1] + 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(cell, str(i), (p0[0] + 4, p0[1] + 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, col, 2, cv2.LINE_AA)
+    if status == "queued":
+        cv2.putText(cell, "QUEUED", (10, c - cap - 12), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    col, 3, cv2.LINE_AA)
+    label = {"auto": "", "manual": " manual", "drawn": " drawn", "queued": " queued"}[status]
+    name = os.path.basename(path)
+    if len(name) > 40:
+        name = name[:18] + "..." + name[-19:]
+    cell[c - cap:] = 40
+    cv2.putText(cell, f"{name}  {len(boxes)}{label}", (6, c - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, col if status != "auto" else (255, 255, 255), 1, cv2.LINE_AA)
+    return cv2.imencode(".jpg", cell, [cv2.IMWRITE_JPEG_QUALITY, 85])[1]
+
+
+def write_debug_sheets(tiles, folder):
+    """Write the debug cells as contact sheets uncollage_debug_01.jpg, ... --
+    DEBUG_PER_SHEET pages each, DEBUG_COLS per row -- into folder. Returns the
+    sheet paths."""
+    tiles = list(tiles)
+    if not tiles:
+        return []
+    os.makedirs(folder, exist_ok=True)
+    c, paths = DEBUG_CELL, []
+    for k in range(0, len(tiles), DEBUG_PER_SHEET):
+        cells = [cv2.imdecode(t, cv2.IMREAD_COLOR) for t in tiles[k:k + DEBUG_PER_SHEET]]
+        cols = min(DEBUG_COLS, len(cells))
+        rows = -(-len(cells) // cols)
+        sheet = np.full((rows * c + (rows - 1) * 4, cols * c + (cols - 1) * 4, 3), 255, np.uint8)
+        for i, cell in enumerate(cells):
+            r, q = divmod(i, cols)
+            sheet[r * (c + 4):r * (c + 4) + c, q * (c + 4):q * (c + 4) + c] = cell
+        out = os.path.join(folder, f"uncollage_debug_{k // DEBUG_PER_SHEET + 1:02d}.jpg")
+        cv2.imwrite(out, sheet, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        paths.append(out)
+    return paths
 
 
 def _looks_generated(stem, stems):
@@ -865,6 +956,9 @@ def main(argv):
                     help="do not open the box editor for failed pages")
     ap.add_argument("--manual", default=MANUAL_FILE_DEFAULT, metavar="FILE",
                     help="manual-boxes file (default %(default)s)")
+    ap.add_argument("-d", "--debug", action="store_true",
+                    help=f"also write contact sheets of every page and its boxes "
+                         f"into {DEBUG_DIR}/ in the output folder")
     opt = ap.parse_args(argv[1:])
     in_path, out_dir, manual_path, no_draw = opt.input, opt.output, opt.manual, opt.no_draw
 
@@ -875,13 +969,15 @@ def main(argv):
         os.makedirs(out_dir, exist_ok=True)
 
     manual = _load_manual(manual_path)
+    debug = {} if opt.debug else None
 
     # Pass 1: process every image; failures are queued in manual["pending"].
     total = 0
     for img_path in iter_input_paths(in_path):
         print(f"processing {img_path}")
         total += process_image(img_path, rectangular=opt.touching,
-                               split_lines=opt.touching, manual=manual, out_dir=out_dir)
+                               split_lines=opt.touching, manual=manual, out_dir=out_dir,
+                               debug=debug)
 
     # Pass 2: draw boxes for the queued failures, then crop them.
     queued = list(manual["pending"])
@@ -897,10 +993,21 @@ def main(argv):
                   "editor for each...")
             nq = len(queued)
             for k, img_path in enumerate(queued, 1):
-                total += _draw_and_crop(img_path, manual, draw_boxes, out_dir, k, nq)
+                total += _draw_and_crop(img_path, manual, draw_boxes, out_dir, k, nq,
+                                        debug=debug)
                 _save_manual(manual)    # persist after each crop, in case of a crash
 
     _save_manual(manual)
+
+    if debug:
+        if out_dir:
+            base = out_dir
+        elif os.path.isdir(in_path):
+            base = in_path
+        else:
+            base = os.path.dirname(os.path.abspath(in_path))
+        sheets = write_debug_sheets(debug.values(), os.path.join(base, DEBUG_DIR))
+        print(f"\ndebug: {len(sheets)} contact sheet(s) in {os.path.join(base, DEBUG_DIR)}")
 
     # Anything still without boxes (skipped in the editor, --no-draw, or headless).
     pending_left = [ap for ap, b in manual["entries"].items() if not b]

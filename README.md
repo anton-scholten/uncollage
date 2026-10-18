@@ -36,7 +36,7 @@ python uncollage.py INPUT [OUTPUT]
 
 `OUTPUT` is the folder for the crops (created if needed); without it, crops go next to each source image.
 
-Crops are named `<original_image>_1`, `<original_image>_2`, ... numbered top-to-bottom then left-to-right. They are pixel-identical to the source: a lossless source (PNG, TIFF, BMP) keeps its format, while a lossy one (JPEG, WebP) is saved as **PNG**, because re-encoding it would change the pixels. A crop whose colour channels are exactly equal (a grey photo, or a grey scan stored as RGB) is saved as a one-channel image with the same pixel values, a third of the size; each crop is judged on its own. (On a colour JPEG page a grey photo usually carries a little chroma noise, so it stays RGB to remain pixel-identical.) Bit depth and alpha are kept; EXIF orientation is not applied (the pixels are cropped as stored).
+Crops are named `<original_image>_1`, `<original_image>_2`, ... numbered row by row (top-to-bottom), left-to-right within a row. They are pixel-identical to the source: a lossless source (PNG, TIFF, BMP) keeps its format, while a lossy one (JPEG, WebP) is saved as **PNG**, because re-encoding it would change the pixels. A crop whose colour channels are exactly equal (a grey photo, or a grey scan stored as RGB) is saved as a one-channel image with the same pixel values, a third of the size; each crop is judged on its own. (On a colour JPEG page a grey photo usually carries a little chroma noise, so it stays RGB to remain pixel-identical.) Bit depth and alpha are kept; EXIF orientation is not applied (the pixels are cropped as stored).
 
 ### Options
 
@@ -45,6 +45,7 @@ Normally none are needed.
 | Option | Meaning |
 |---|---|
 | `--touching`, `-t` | Also cut photos that are butted together with **no** gap: along straight shadow seams, and along full-span straight print edges. Off by default, because on ordinary scans it can cut a photo along its own straight horizon or edge. Use it for scans you know are butted composites. |
+| `--debug`, `-d` | Also write contact sheets (`uncollage_debug_01.jpg`, ...) into an `uncollage_debug/` subfolder of `OUTPUT` (or of the input's folder): each page as a thumbnail with its boxes numbered like the crop files, 12 pages per sheet. Box colours: red = cropped automatically, magenta = queued for manual boxes (showing what was detected), green = boxes from the manual file, blue = boxes drawn in this run. |
 | `--no-draw` | Do not open the box editor for failed pages; just list them in the manual file (for headless/batch use). |
 | `--manual FILE` | Path to the manual-boxes file (default `manual_boxes.txt`). |
 
@@ -81,6 +82,7 @@ python uncollage.py page.jpg              # one page, crops beside it
 python uncollage.py scans/ crops/         # whole folder -> crops/
 python uncollage.py montages/ crops/ -t   # butted composites with no gaps
 python uncollage.py list.txt --no-draw    # batch, no GUI
+python uncollage.py scans/ crops/ -d      # + contact sheets in crops/uncollage_debug/
 ```
 
 ---

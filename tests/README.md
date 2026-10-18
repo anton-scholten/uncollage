@@ -43,7 +43,9 @@ Plus controls: `touching` without `--rectangular` stays merged;
 `--split-lines` does **not** over-split the cleanly separated page; crops of a
 JPEG source are PNGs pixel-identical to the decoded source; every crop box
 fully contains its photo (padding, never clipping); on a colour page, crops of
-grey photos are written as one channel and colour ones stay colour. An end-to-end test runs
+grey photos are written as one channel and colour ones stay colour; photos side
+by side are numbered left-to-right even when their tops differ; `--debug`
+pages its contact sheets 12 to a sheet. An end-to-end test runs
 `process_image` and checks the actual files written.
 
 ## Real-photo suite
