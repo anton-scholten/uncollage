@@ -143,7 +143,7 @@ def draw(image_path, index=None, total=None):
     The toolbar buttons (Undo / Clear / Save / Cancel) show a tooltip on hover;
     the same actions are on u / r / Enter / Esc.
     """
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
     if img is None:
         print(f"error: could not read image: {image_path}")
         return None

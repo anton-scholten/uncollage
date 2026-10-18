@@ -4,14 +4,14 @@
 
 # Uncollage
 
-Separates a scanned page or collage into its individual sub-images (photos, postcards, prints).
-Detection is based on the uniform scanner/paper background, so sub-images may touch each other and the page edge, and may be slightly rotated (but each is cropped using a rectangle surrounding it so no pixel rotations when saving).
+Separates scanned pages or collages into their individual photos (prints, postcards).
+Detection is based on the paper/scanner background around the photos -- any colour, and uneven lighting is followed -- so photos may touch each other and the page edge, and may be rotated or irregularly shaped. Each photo is cropped as an upright rectangle around it (no rotation), with a small margin so no part of it is cut off; neighbouring crops may overlap. Crops are **pixel-identical** to the source.
 
 This toolkit has three programs:
 
 | Program | What it does |
 |---|---|
-| `uncollage.py` | Main tool: automatic splitting + fallback to the pop-up window for difficult collages (see `draw_boxes.py`). |
+| `uncollage.py` | Main tool: automatic splitting + fallback to a box editor for pages it cannot split. |
 | `draw_boxes.py` | Simple GUI to draw and edit bounding boxes for sub-images to be cropped from a collage. Can be used standalone. |
 | `sam_uncollage.py` | Optional code to allow splitting using Meta's pretrained Segment Anything model. |
 
@@ -25,27 +25,35 @@ This toolkit has three programs:
 ## uncollage.py
 
 ```
-python uncollage.py [options] PATH
+python uncollage.py INPUT [OUTPUT]
 ```
 
-`PATH` may be:
-- an **image file** → its sub-images are extracted;
+`INPUT` may be:
+- an **image file**;
 - a **folder** → every image in it is processed (non-recursive).
-  Files that look like sub-images this tool already wrote (e.g. `<original_image>_<n>`) are skipped, so re-running a folder does not re-crop its own outputs;
+  Files that look like crops this tool already wrote (`<original_image>_<n>`) are skipped, so re-running a folder does not re-crop its own outputs;
 - a **text file** → each line is an image path (relative paths based on the text file's folder; blank lines and `#` comments are ignored).
 
-Crops are named `<original_image>_1.<ext>`, `<original_image>_2.<ext>`, ... numbered top-to-bottom then left-to-right.
+`OUTPUT` is the folder for the crops (created if needed); without it, crops go next to each source image.
+
+Crops are named `<original_image>_1`, `<original_image>_2`, ... numbered top-to-bottom then left-to-right. They are pixel-identical to the source: a lossless source (PNG, TIFF, BMP) keeps its format, while a lossy one (JPEG, WebP) is saved as **PNG**, because re-encoding it would change the pixels. A crop whose colour channels are exactly equal (a grey photo, or a grey scan stored as RGB) is saved as a one-channel image with the same pixel values, a third of the size; each crop is judged on its own. (On a colour JPEG page a grey photo usually carries a little chroma noise, so it stays RGB to remain pixel-identical.) Bit depth and alpha are kept; EXIF orientation is not applied (the pixels are cropped as stored).
 
 ### Options
 
+Normally none are needed.
+
 | Option | Meaning |
 |---|---|
-| `--out DIR`, `-o DIR` | Write every crop into `DIR` (created if needed), keeping each source's base name. Without it, crops go next to their source image. |
-| `--rectangular`, `-r` | Assume sub-images are rectangles and additionally split merged blobs along straight background/shadow seams (guillotine cut). Best for non-rotated photos. |
-| `--ai`, `-a` | Like `--rectangular`, but seams come from the small offline net in `seam_ai.py` (needs `seam_model.npz`; train once with `python seam_ai.py train`). |
-| `--split-lines`, `-l` | Also split a blob wherever a **full-span straight** content boundary shows it is several butted-together photos with no gap (e.g. touching postcards). A cut must be straight and leave two pieces that each look like a real photo; a piece left too uniform (a sky/sea slice) is discarded, and a cut that would only peel one off is rejected — so a photo's own straight horizon does not split it. **Off by default** (two textured halves of one photo split by a strong straight edge could over-split); enable only on scans you know are composites. |
-| `--manual FILE` | Path to the manual-boxes cache (default `manual_boxes.txt`). |
+| `--touching`, `-t` | Also cut photos that are butted together with **no** gap: along straight shadow seams, and along full-span straight print edges. Off by default, because on ordinary scans it can cut a photo along its own straight horizon or edge. Use it for scans you know are butted composites. |
 | `--no-draw` | Do not open the box editor for failed pages; just list them in the manual file (for headless/batch use). |
+| `--manual FILE` | Path to the manual-boxes file (default `manual_boxes.txt`). |
+
+### How it works
+
+1. Detection runs on a copy scaled down to at most 3000 px (a 1200 dpi A4 scan is ~14000 px), which is faster and ignores film grain; boxes are mapped back to full resolution.
+2. **Background:** a smooth quadratic surface is fitted to the page's edge pixels, ignoring photos that run off the edge and dark scanner-lid strips. This handles any paper colour and lighting gradients. If no background surrounds the page (a frameless montage), the page's most frequent colour (its seams) is used instead.
+3. A pixel is background when it is smooth, close to that surface, and connected to the page border. "Close" is set from how much the page's own paper strays from the surface, so on clean scanner paper a print's off-white border still counts as part of the print. Pale areas enclosed by a photo (sky, snow) stay part of the photo.
+4. Each large foreground blob is a photo. A blob that is not rectangle-shaped (photos touching at a corner, or bridged by the shadow a thick print casts) is eroded until it falls apart into one core per photo; every pixel then goes to its nearest core, so each photo keeps its full extent. The split is kept only if every resulting piece is clearly rectangular.
 
 ### Manual-boxes fallback (for pages that can't be split automatically)
 
@@ -61,18 +69,18 @@ in one run:
 With `--no-draw` (or a headless machine with no display), the second pass is skipped and the queued pages are listed in the manual file to be manually drawn later with:
 
 ```
-python uncollage.py scans/                 # crops what it can, queues the rest
-python draw_boxes.py manual_boxes.txt       # draw boxes for the queued pages
-python uncollage.py scans/                  # re-run: cached boxes are used
+python uncollage.py scans/ crops/ --no-draw   # crops what it can, queues the rest
+python draw_boxes.py manual_boxes.txt          # draw boxes for the queued pages
+python uncollage.py scans/ crops/              # re-run: cached boxes are used
 ```
 
 ### Examples
 
 ```
-python uncollage.py page.jpg                       # one page, crops beside it
-python uncollage.py scans/ -o crops/               # whole folder -> crops/
-python uncollage.py scans/ -r -l                    # rectangular + line splitting
-python uncollage.py list.txt --no-draw              # batch, no GUI
+python uncollage.py page.jpg              # one page, crops beside it
+python uncollage.py scans/ crops/         # whole folder -> crops/
+python uncollage.py montages/ crops/ -t   # butted composites with no gaps
+python uncollage.py list.txt --no-draw    # batch, no GUI
 ```
 
 ---
@@ -131,25 +139,20 @@ python sam_uncollage.py IMG --boxes boxes.txt [--debug]    # box-prompted (relia
 
 ---
 
-## seam_ai.py (optional, for `--ai`)
-
-A tiny offline NumPy net that predicts photo-boundary seams, trained on synthetic
-collages. Train once, then use `uncollage.py --ai`.
-
-```
-python seam_ai.py train [img1 img2 ...]   # (re)train -> seam_model.npz
-python seam_ai.py show  IMG               # write IMG.seams.png heat-map
-```
-
----
-
 ## Notes & limitations
 
-- Photos that physically overlap, or butt together with **no** separator (no
-  gap, border, or tonal edge) and no straight seam, can't be told apart
-  automatically — use the manual-boxes fallback.
-- `--split-lines` can't distinguish a real print seam from a photo's own strong
-  straight internal edge purely by geometry; the uniformity check mitigates this
-  (uniform sky/sea slices are dropped), but it stays opt-in.
+- Photos that physically overlap, or butt together along a whole edge with
+  **no** gap, border or shadow between them, come out as one crop (see
+  `--touching`). Faded, borderless photos whose edges are invisible in the
+  scan, and pages where one blob spans the page, are queued for the
+  manual-boxes fallback.
+- A print border of exactly the paper's tone (white on white, with no shadow
+  or edge line) is invisible and may be cropped off; the photo itself is kept.
+- An album page or mount card carrying several photos is treated as one
+  photo if the sheet's colour is close to the photos'; such pages are usually
+  queued.
+- `--touching` can't distinguish a real print seam from a photo's own strong
+  straight internal edge purely by geometry; the uniformity check mitigates
+  this (uniform sky/sea slices are dropped), but it stays opt-in.
 - Crops keep each sub-image's original orientation (upright bounding box); a
   rotated sub-image therefore keeps small background corners.

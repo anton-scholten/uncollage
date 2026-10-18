@@ -1,92 +1,68 @@
 #!/usr/bin/env python3
 """
-uncollage.py -- Separate an image collage / scanned page into individual sub-images.
+uncollage.py -- Separate scanned pages / collages into their individual photos.
 
 Usage:
-    python uncollage.py [options] PATH
+    python uncollage.py INPUT [OUTPUT] [--touching] [--no-draw] [--manual FILE]
 
-  * --out DIR (-o DIR): write every crop into DIR (created if needed), keeping
-    each source's base name; without it crops go next to their source image.
-  * If PATH is an image file, its sub-images are extracted.
-  * If PATH is a folder, every image in it is processed (non-recursive). Files
-    that look like sub-images this tool already wrote (<stem>_<n> whose parent
-    <stem> image is also in the folder) are skipped, so re-running a folder does
-    not re-crop its own outputs.
-  * If PATH is a text file, every line is treated as an image path and all of
-    them are processed in batch. Blank lines and lines starting with '#' are
-    ignored. Relative paths are resolved against the text file's own folder.
+  INPUT   an image, a folder of images (non-recursive), or a text file listing
+          one image path per line (blank lines and '#' comments ignored;
+          relative paths are relative to the text file).
+  OUTPUT  folder for the crops (created if needed). Without it, crops are
+          written next to each source image.
 
-  * --rectangular (-r): assume every sub-image is a rectangle and additionally
-    use line detection to split merged blobs (see "Rectangular mode" below).
-  * --ai (-a): like --rectangular, but the seams are found by a small offline
-    neural net (seam_ai.py, weights in seam_model.npz) instead of only the
-    hand-crafted cues. Train it once with `python seam_ai.py train`.
-  * --split-lines (-l): also split a blob wherever a full-span STRAIGHT content
-    boundary shows it is several butted-together photos with no gap between them
-    (e.g. the touching postcards in 69.jpg). A cut must be straight and leave two
-    pieces that each look like a real photo; a piece left too uniform (a sky/sea
-    slice) is discarded rather than saved, and a cut that would only peel such a
-    slice off is rejected -- so a photo's own straight horizon does not split it.
-    Still OFF by default: two textured halves of one photo split by a strong
-    straight internal edge could be over-split, so enable it on scans you know
-    are composites; for anything ambiguous prefer the manual-boxes fallback.
+  Crops are named <stem>_1, <stem>_2, ... (top-to-bottom, then left-to-right).
+  They are pixel-identical to the source: a lossless source keeps its format,
+  a lossy one (JPEG, WebP) is saved as PNG, since re-encoding it would alter
+  the pixels. A folder re-run skips the <stem>_<n> files it wrote itself.
 
-Manual-boxes fallback (automatic):
-  Some pages cannot be split automatically (e.g. faded, borderless photos on
-  shadowed paper, whose edges are not visible in the scan). Every input image is
-  processed first; any page whose automatic split looks merged/failed is queued.
-  After the batch, uncollage opens a box editor (draw_boxes.py) for each queued
-  page in turn -- drag one rough box per photo (s/Enter to save, q/Esc to skip)
-  -- and its sub-images are cropped immediately from the boxes you draw. The
-  boxes are cached in a manual-boxes file (default manual_boxes.txt, override
-  with --manual FILE) so a later run reuses them without asking again.
+  --touching (-t)  also cut blobs where photos are butted together with no gap
+                   (straight shadow seams and full-span straight print edges).
+                   Off by default: on ordinary scans it can cut a photo along
+                   its own straight horizon or edge.
+  --no-draw        do not open the box editor for pages that could not be split
+                   (see below); just list them in the manual-boxes file.
+  --manual FILE    manual-boxes file (default manual_boxes.txt).
 
-  --no-draw (or a headless session with no display) skips the editor and just
-  lists the queued pages in the manual-boxes file; draw them later with
+Manual-boxes fallback:
+  A page whose automatic split looks failed (one page-sized blob, or a blob
+  that dwarfs the rest) is queued rather than cropped. After the batch, a box
+  editor (draw_boxes.py) opens for each queued page: drag one rough box per
+  photo (s/Enter save, q/Esc skip). The boxes are cached in the manual-boxes
+  file, so a later run reuses them. Without a display (or with --no-draw) the
+  pages are only listed there; draw them later with
   `python draw_boxes.py manual_boxes.txt` and re-run.
 
-Output sub-images are written next to each source image, named
-    <stem>_1.<ext>, <stem>_2.<ext>, ...
-(numbered top-to-bottom, then left-to-right).
-
-Design notes / guarantees:
-  * Sub-images may touch each other and may touch the edge of the original
-    image -- detection is based on the uniform scanner/paper background, not on
-    an assumed margin.
-  * Sub-images may be rotated. Each is cropped as the UPRIGHT bounding box of
-    its (possibly tilted) region, so the crop keeps the sub-image in its
-    original orientation -- it is NOT de-skewed / un-rotated. A rotated
-    sub-image therefore keeps small background corners, as expected.
-
 Method:
-  The background is the large, uniform, low-texture region that the scanner/
-  paper forms around the photos. A pixel is treated as background when its
-  colour is close to the estimated background colour AND its local texture is
-  low; the background proper is the part of that connected to the image border
-  (flood fill). Everything else is foreground. Each sufficiently large,
-  rectangle-like foreground blob becomes one sub-image.
-
-Rectangular mode (--rectangular):
-  When two rectangular photos touch, the background gap / light border / dark
-  shadow between them is a straight line. This mode detects such a straight
-  separator and recursively cuts each foreground blob along it (a "guillotine"
-  split), so touching photos that the plain method would merge -- e.g. where a
-  border seam is bridged at a point -- are separated. A candidate cut is a full
-  span horizontal or vertical line most of whose length runs along the
-  background OR along a dark shadow ridge, and which actually severs the blob
-  into two large parts. Cuts are axis-aligned, so this best suits photos that
-  are upright or only slightly rotated.
+  Detection runs on a copy downscaled to at most WORK_MAX px; boxes are mapped
+  back to full resolution and padded by BOX_PAD so a photo is never clipped --
+  neighbouring boxes may overlap.
+  * Background colour: of a few candidates (the page's most frequent colours
+    and the most frequent colour of its outer ring), the one that covers most of
+    the page edge -- paper surrounds the photos; any colour works.
+  * Gradients: a smooth quadratic surface is fitted to the paper found and
+    refitted, so uneven scanner lighting or tinted paper is followed.
+  * A pixel is background when it is smooth and close to that surface, and
+    connected to the page border; enclosed pale areas (sky, snow) stay photo.
+  * Each large foreground blob is one photo. A blob that is not
+    rectangle-shaped (photos touching at a corner or across a shadow) is cut
+    with a growing morphological opening, kept only if every piece is a large,
+    more rectangular blob.
+  * With --touching, blobs are further cut along straight shadow seams
+    (guillotine) and full-span straight print edges.
+  Each photo is cropped as the UPRIGHT bounding box of its region (no
+  de-skewing), so a tilted photo keeps small background corners.
 
 Limitation:
-  Photos that physically overlap, or butt together with no separator at all
-  (no gap, border, or tonal edge) between them, cannot be told apart by any
-  background/line based method and may be emitted as a single sub-image. Cuts
-  in rectangular mode are horizontal/vertical, so strongly rotated touching
-  photos are not split.
+  Photos that overlap, or butt together along a whole edge with no gap,
+  border or shadow between them, come out as one crop (or, with --touching,
+  may be cut); faded borderless photos whose edges are invisible in the scan
+  are queued for manual boxes.
 
 Requires: opencv-python (cv2), numpy.
 """
 
+import argparse
 import os
 import re
 import sys
@@ -100,21 +76,34 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 # --- Tunables -----------------------------------------------------------------
 MIN_AREA_FRAC = 0.01     # blob must be >= this fraction of the page to count
 COLOR_TOL = 30.0         # max colour distance from background to be "background"
+TOL_K = 4.0              # ... on a page with paper around the photos: this many
+TOL_MIN = 20.0           # x the paper's median deviation, but at least TOL_MIN
 TEXTURE_TOL = 12.0       # max local std-dev to be "background" (smooth)
 FILL_RATIO_MIN = 0.55    # blob area / its rotated-bounding-rect area (rejects
                          # thin frames / speckle; a real photo is a full quad)
+KEEP_AREA_FRAC = 0.05    # ... but a blob this large is kept whatever its shape
+SPLIT_FILL = 0.95        # a blob filling its rotated rect less than this may be
+SPLIT_PIECE_FILL = 0.85  # ... and is cut only into pieces at least this rectangular
+SPLIT_KERNELS = (0.01, 0.02, 0.04, 0.08)  # touching photos: tried opening sizes (x page)
+WORK_MAX = 3000          # detection runs on a copy downscaled to this long side
+                         # (high-dpi scans: faster, less grain; boxes scaled back)
+BOX_PAD = 0.003          # crop boxes grow by this fraction of the page's long
+                         # side, so a photo is never clipped (boxes may overlap)
+LOSSY_EXTS = {".jpg", ".jpeg", ".webp"}  # crops of these are saved as PNG
+BG_EDGE_MIN = 0.50       # paper must cover this much of the image edge
+BG_FIT_ITERS = 3         # outlier-rejecting refits of the background surface
 # --- Rectangular-mode (guillotine split) tunables -----------------------------
 SEAM_THRESH = 0.70       # min fraction of a cut line that must look like a seam
-SEAM_THRESH_AI = 0.55    # ... when seams come from the learned model (softer maps)
 SEAM_MIN_SPAN = 0.85     # a cut must span >= this fraction of the blob's extent
 SEAM_RIDGE_MARGIN = 14   # a shadow ridge must be this much darker than its sides
 SEAM_MAX_DEPTH = 6       # max recursive cuts per blob
-AI_PROB_THRESH = 0.30    # learned seam probability above which a pixel is a seam
 # --- Manual-boxes fallback ----------------------------------------------------
 MANUAL_FILE_DEFAULT = "manual_boxes.txt"  # where failed pages are listed
-MANUAL_SPAN = 0.80          # a box spanning >= this of BOTH page dims => failed
-MANUAL_DOMINANT_AREA = 0.55 # a blob >= this fraction of the page ...
-MANUAL_DOMINANT_RATIO = 3.0 # ... and >= this x the next largest => it merged some
+MANUAL_SPAN = 0.80          # a box spanning >= this of BOTH page dims is checked
+                            # for a straight seam (several butted photos)
+MANUAL_DOMINANT_AREA = 0.55 # a box >= this fraction of the page that runs to 3
+                            # page edges, or that is ...
+MANUAL_DOMINANT_RATIO = 3.0 # ... >= this x the next largest => it merged some
 # --- Straight-line composition split ------------------------------------------
 LINE_COV_THRESH = 0.80   # a full-span content boundary crosses >= this of the box
 LINE_JUMP = 30.0         # per-column colour distance counted as an edge crossing
@@ -130,62 +119,137 @@ LINE_MAX_DEPTH = 5       # max recursive line cuts per blob
 # ------------------------------------------------------------------------------
 
 
-def estimate_background(img):
-    """Estimate the background colour as the image's dominant (modal) colour.
+def _page_mode(img):
+    """The page's most frequent colour (fullest bin of a coarse 3-D histogram)."""
+    px = img.reshape(-1, 3)
+    q = (px // 16).astype(np.int32)
+    codes = (q[:, 0] * 16 + q[:, 1]) * 16 + q[:, 2]
+    peak = np.bincount(codes, minlength=16 ** 3).argmax()
+    # float64: a float32 running sum saturates on a large scan (~10^8 pixels at
+    # 1200 dpi) and drifts far too dark.
+    return px[codes == peak].mean(axis=0, dtype=np.float64).astype(np.float32)
 
-    The scanner/paper background is the single largest uniform area, so the
-    most frequent colour is a robust estimate -- unlike a border average, it is
-    not fooled by photos that run off the edge of the page.
+
+def _color_dist(img, field):
+    """Per-pixel colour distance between img and a background colour/field."""
+    diff = img.astype(np.float32) - field
+    return np.sqrt((diff * diff).sum(axis=-1))
+
+
+def _border_connected(bg_like):
+    """The part of a bg-like map connected to the image border -- the paper
+    proper. Pockets *enclosed* by a photo (sky, snow, pale walls) are dropped."""
+    n, labels = cv2.connectedComponents(bg_like.astype(np.uint8), connectivity=8)
+    border = np.unique(np.concatenate(
+        [labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]]))
+    border = border[border > 0]
+    return np.isin(labels, border)
+
+
+def _surface_terms(x, y, w, h):
+    """Design matrix of a quadratic surface in normalised page coordinates."""
+    x, y = x / w - 0.5, y / h - 0.5
+    return np.stack([np.ones_like(x), x, y, x * x, x * y, y * y], axis=-1)
+
+
+def _fit_surface(xs, ys, colours, w, h):
+    """Least-squares quadratic surface (per channel) through the given pixels;
+    returns its coefficients."""
+    step = max(1, len(xs) // 50000)          # a subsample is plenty for 6 terms
+    t = _surface_terms(xs[::step].astype(np.float64), ys[::step].astype(np.float64), w, h)
+    coef, *_ = np.linalg.lstsq(t, colours[::step].astype(np.float64), rcond=None)
+    return coef.astype(np.float32)
+
+
+def _eval_surface(coef, w, h):
+    """The fitted surface evaluated at every pixel of a w x h page (by
+    broadcasting a row of x against a column of y -- no per-term images)."""
+    x = (np.arange(w, dtype=np.float32) / w - 0.5)[None, :, None]
+    y = (np.arange(h, dtype=np.float32) / h - 0.5)[:, None, None]
+    c = coef[:, None, None, :]
+    return c[0] + c[1] * x + c[2] * y + c[3] * x * x + c[4] * x * y + c[5] * y * y
+
+
+def background_field(img, smooth):
+    """(field, tol): per-pixel background colour of the page (any colour,
+    uneven lighting) and the colour tolerance that still counts as paper.
+
+    Paper surrounds the photos, so most of the image's edge is smooth paper. A
+    quadratic surface is fitted to the smooth edge pixels with outlier
+    rejection (start: their median colour), which follows a scanner lighting
+    gradient or tinted paper and ignores photos running off the edge or a dark
+    scanner-lid strip; it is then refitted once to the paper found inside. If
+    the edge fit's inliers cover less than BG_EDGE_MIN of the edge -- a
+    frameless montage, photos to every edge -- the page's most frequent colour
+    (typically its seams) is used as a flat background instead, with the
+    default tolerance COLOR_TOL.
     """
-    # Coarse 3-D colour histogram; the fullest bin is the background.
-    bins = 16
-    step = 256 // bins
-    q = (img // step).reshape(-1, 3)
-    codes = (q[:, 0].astype(np.int32) * bins + q[:, 1]) * bins + q[:, 2]
-    peak = np.bincount(codes, minlength=bins ** 3).argmax()
-    # Average the actual pixels in that bin for a precise colour.
-    sel = codes == peak
-    return img.reshape(-1, 3)[sel].astype(np.float32).mean(axis=0)
+    h, w = img.shape[:2]
+    n = np.arange
+    xs = np.concatenate([n(w), n(w), np.zeros(h, int), np.full(h, w - 1)])
+    ys = np.concatenate([np.zeros(w, int), np.full(w, h - 1), n(h), n(h)])
+    px, ok = img[ys, xs].astype(np.float32), smooth[ys, xs]
+    inl = ok.copy()
+    if ok.mean() >= BG_EDGE_MIN:
+        est = np.median(px[ok], axis=0)
+        tol = 2 * COLOR_TOL                   # loose first pass admits a gradient
+        for _ in range(BG_FIT_ITERS):
+            inl = ok & (_color_dist(px, est) < tol)
+            if inl.sum() < 6:
+                break
+            coef = _fit_surface(xs[inl], ys[inl], px[inl], w, h)
+            est = _surface_terms(xs.astype(np.float32), ys.astype(np.float32), w, h) @ coef
+            tol = COLOR_TOL
+        inl = ok & (_color_dist(px, est) < COLOR_TOL)
+    if inl.mean() < BG_EDGE_MIN:
+        return np.broadcast_to(_page_mode(img), img.shape).astype(np.float32), COLOR_TOL
+
+    # One refit to all the paper found inside (smooth, close to the edge fit,
+    # connected to the border) pins the surface down where the edge is mostly
+    # covered by photos. Only one: repeated refits drift, letting pale skies
+    # that leak through the gaps pull the surface along.
+    field = _eval_surface(coef, w, h)
+    pys, pxs = np.nonzero(_border_connected(smooth & (_color_dist(img, field) < COLOR_TOL)))
+    field = _eval_surface(_fit_surface(pxs, pys, img[pys, pxs], w, h), w, h)
+    # Tolerance from how far the paper actually strays from the surface: clean
+    # scanner paper is far tighter than COLOR_TOL, and a tight tolerance keeps
+    # a print's off-white border (a few levels off the paper) with the print.
+    resid = _color_dist(img[ys[inl], xs[inl]], field[ys[inl], xs[inl]])
+    tol = float(np.clip(TOL_K * np.median(resid), TOL_MIN, COLOR_TOL))
+    return field, tol
+
+
+def _local_std(gray, win):
+    """Rolling standard deviation over a win x win window."""
+    mean = cv2.boxFilter(gray, -1, (win, win), normalize=True)
+    sqmean = cv2.boxFilter(gray * gray, -1, (win, win), normalize=True)
+    return np.sqrt(np.maximum(sqmean - mean * mean, 0.0))
 
 
 def foreground_mask(img):
-    """Return a binary mask (uint8 0/255) whose blobs are the sub-images."""
+    """Return (mask, field): a binary mask (uint8 0/255) whose blobs are the
+    sub-images, and the per-pixel background colour it was measured against."""
     h, w = img.shape[:2]
-    bg = estimate_background(img)
-
-    # Colour distance from the background colour.
-    diff = img.astype(np.float32) - bg[None, None, :]
-    dist = np.sqrt((diff * diff).sum(axis=2))
 
     # Local texture (rolling standard deviation). Kept small so that thin
     # background gaps between photos are not swallowed by neighbouring detail.
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    win = max(3, int(round(min(h, w) * 0.003)) | 1)
-    mean = cv2.boxFilter(gray, -1, (win, win), normalize=True)
-    sqmean = cv2.boxFilter(gray * gray, -1, (win, win), normalize=True)
-    std = np.sqrt(np.maximum(sqmean - mean * mean, 0.0))
+    smooth = _local_std(gray, max(3, int(round(min(h, w) * 0.003)) | 1)) < TEXTURE_TOL
+    field, tol = background_field(img, smooth)
 
-    # Background = close to the background colour AND smooth.
-    bg_like = ((dist < COLOR_TOL) & (std < TEXTURE_TOL)).astype(np.uint8)
-
-    # The true background is the bg-like region connected to the image border;
-    # bg-like pockets *enclosed* by a photo (sky, snow, pale walls) are kept as
-    # foreground, which is what we want.
-    n, labels = cv2.connectedComponents(bg_like, connectivity=8)
-    border_labels = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) \
-        | set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
-    border_labels.discard(0)
-    background = np.isin(labels, list(border_labels))
+    # Background = close to the (local) background colour AND smooth, and
+    # connected to the image border.
+    background = _border_connected(smooth & (_color_dist(img, field) < tol))
     fg = (~background).astype(np.uint8) * 255
 
     # Drop dust/speckle. Kernel stays small to preserve gaps between photos.
     k = max(3, int(round(min(h, w) * 0.004)) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=1)
-    return fg
+    return fg, field
 
 
-def _seam_maps(img):
+def _seam_maps(img, field):
     """Return two boolean maps marking pixels that look like a photo boundary.
 
     seam_h -- suitable for a HORIZONTAL cut: background, or a dark ridge that is
@@ -194,9 +258,7 @@ def _seam_maps(img):
     seam_v -- the same for a VERTICAL cut (compares left/right neighbours).
     """
     h, w = img.shape[:2]
-    bg = estimate_background(img)
-    diff = img.astype(np.float32) - bg[None, None, :]
-    bg_like = np.sqrt((diff * diff).sum(axis=2)) < COLOR_TOL
+    bg_like = _color_dist(img, field) < COLOR_TOL
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
     off = max(4, int(round(min(h, w) * 0.012)))
@@ -275,29 +337,84 @@ def _split_rectangular(mask, seam_h, seam_v, min_area, seam_thresh, depth=0):
     return out
 
 
-def _blob_to_box(blob):
-    """Return the upright crop box for a blob mask, or None if it isn't a photo."""
+def _rect_fill(blob):
+    """(fill, contour): how fully a blob's largest contour fills its rotated
+    bounding rectangle (1.0 = a perfect, possibly tilted, rectangle)."""
     contours, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None
+        return 0.0, None
     c = max(contours, key=cv2.contourArea)
     (_, _), (rw, rh), _ = cv2.minAreaRect(c)
+    return (cv2.contourArea(c) / (rw * rh) if rw * rh else 0.0), c
+
+
+def _split_touching(blob, min_area):
+    """Separate photos that touch -- corner to corner, along a short stretch of
+    edge, or bridged by the shadow a thick print casts. Such a blob is not
+    rectangle-shaped. Eroding it with a growing square kernel leaves one core
+    per photo once the kernel is wider than the contact or bridge. Every blob
+    pixel then goes to its nearest core: the cores are the photos shrunk
+    evenly, so the dividing line falls on the real contact (or mid-bridge),
+    and each photo keeps its full extent. Pieces are split again if need be;
+    the split is kept only if every final piece is a large, clearly
+    rectangular blob (SPLIT_PIECE_FILL) that fills its rectangle better than
+    the merged blob did -- so a single ragged photo, or a pale one whose sky
+    leaked into the paper, stays whole."""
+    fill, _ = _rect_fill(blob)
+    if fill >= SPLIT_FILL:
+        return [blob]
+    # Kernel sizes scale with the page; the work runs on the blob's own
+    # bounding box only, which is much faster than the page.
+    page = min(blob.shape)
+    x, y, bw, bh = cv2.boundingRect(blob)
+    sub = blob[y:y + bh, x:x + bw]
+    # Pieces are cut from the blob minus lines thinner than the smallest kernel
+    # (a scanner-lid line, a dust trail) so those do not spoil a piece's shape.
+    g = max(3, int(SPLIT_KERNELS[0] * page) | 1)
+    body = cv2.morphologyEx(sub, cv2.MORPH_OPEN, np.ones((g, g), np.uint8))
+    for frac in SPLIT_KERNELS:
+        k = max(3, int(frac * page) | 1)
+        # square kernel: separable, so fast even when large
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(
+            cv2.erode(sub, np.ones((k, k), np.uint8)))
+        cores = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area / 4]
+        if len(cores) < 2:
+            continue
+        core_px = np.isin(labels, cores)
+        # nearest-core label for every pixel (labels number the zero pixels
+        # of the input, i.e. the core pixels, in scan order)
+        _, near = cv2.distanceTransformWithLabels(
+            (~core_px).astype(np.uint8), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+        owner = np.zeros(near.max() + 1, np.int32)
+        owner[near[core_px]] = labels[core_px]
+        nearest = owner[near]
+        pieces = []
+        for i in cores:
+            piece = np.zeros_like(blob)
+            piece[y:y + bh, x:x + bw] = ((nearest == i) & (body > 0)).astype(np.uint8) * 255
+            pieces.append(piece)
+        # a piece may hold several photos itself (a wider bridge) -- recurse,
+        # and judge the final pieces
+        leaves = [q for p in pieces for q in _split_touching(p, min_area)]
+        if all(cv2.countNonZero(q) >= min_area and _rect_fill(q)[0] > max(fill, SPLIT_PIECE_FILL)
+               for q in leaves):
+            return leaves
+    return [blob]
+
+
+def _blob_to_box(blob, keep_area):
+    """Return the upright crop box for a blob mask, or None if it isn't a photo."""
+    fill, c = _rect_fill(blob)
     # Reject shapes that do not fill their (rotated) bounding rectangle -- thin
     # frames, speckle rings, stray marks. A photo fills its minAreaRect closely.
-    if rw * rh == 0 or cv2.contourArea(c) / (rw * rh) < FILL_RATIO_MIN:
+    # A blob of at least keep_area pixels is kept whatever its shape: it is
+    # photos that could not be separated, and cropping them together beats
+    # losing them.
+    if c is None or (fill < FILL_RATIO_MIN and cv2.countNonZero(blob) < keep_area):
         return None
     # Upright bounding box keeps the sub-image in its original orientation
     # (no de-skewing), as required.
     return cv2.boundingRect(c)
-
-
-def _ai_seam_maps(img):
-    """Seam maps from the offline learned model (seam_ai). OR-ed with the
-    hand-crafted cues so the split benefits from both."""
-    import seam_ai  # local import: only needed for --ai
-    prob_h, prob_v = seam_ai.predict_seam_maps(img)
-    base_h, base_v = _seam_maps(img)
-    return (prob_h > AI_PROB_THRESH) | base_h, (prob_v > AI_PROB_THRESH) | base_v
 
 
 def _disc_coverage(region, axis):
@@ -439,28 +556,38 @@ def _split_blob_by_lines(img, blob, min_area, depth=0):
             for out in _split_blob_by_lines(img, pb, min_area, depth + 1)]
 
 
-def find_subimages(img, rectangular=False, ai=False, split_lines=False):
+def find_subimages(img, rectangular=False, split_lines=False):
     """Return a list of (x, y, w, h) upright crop boxes, one per sub-image.
 
-    When rectangular is True, each foreground blob is additionally split along
-    detected straight seams (see _split_rectangular). When ai is True, the seam
-    maps come from the offline learned model in seam_ai.py (implies rectangular).
+    img may be any image cv2 reads (grey, alpha, 16-bit). Detection runs on an
+    8-bit BGR copy whose long side is at most WORK_MAX; the boxes are mapped
+    back to full resolution and padded by BOX_PAD (clipped to the page), so a
+    photo is never clipped even if neighbouring boxes then overlap.
+
+    rectangular: also guillotine-split blobs along straight background/shadow
+    seams (_split_rectangular). split_lines: also split blobs along full-span
+    straight print edges (_split_blob_by_lines). The CLI's --touching sets both.
     """
+    H, W = img.shape[:2]
+    img = _to_bgr8(img)
+    scale = min(1.0, WORK_MAX / max(H, W))
+    if scale < 1.0:
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     h, w = img.shape[:2]
-    mask = foreground_mask(img)
+    mask, field = foreground_mask(img)
     min_area = MIN_AREA_FRAC * h * w
 
-    # Split the mask into connected foreground blobs.
+    # Split the mask into connected foreground blobs, separating photos that
+    # touch at a corner or across a shadow.
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
-    blobs = [(labels == i).astype(np.uint8) * 255
-             for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+    blobs = [piece for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area
+             for piece in _split_touching((labels == i).astype(np.uint8) * 255, min_area)]
 
-    if (rectangular or ai) and blobs:
-        seam_h, seam_v = _ai_seam_maps(img) if ai else _seam_maps(img)
-        seam_thresh = SEAM_THRESH_AI if ai else SEAM_THRESH
+    if rectangular and blobs:
+        seam_h, seam_v = _seam_maps(img, field)
         blobs = [piece
                  for blob in blobs
-                 for piece in _split_rectangular(blob, seam_h, seam_v, min_area, seam_thresh)]
+                 for piece in _split_rectangular(blob, seam_h, seam_v, min_area, SEAM_THRESH)]
 
     # Opt-in: split any blob that a full-span STRAIGHT boundary shows is really
     # several butted-together photos (e.g. touching postcards with no gap). Off
@@ -471,8 +598,33 @@ def find_subimages(img, rectangular=False, ai=False, split_lines=False):
         blobs = [piece for blob in blobs
                  for piece in _split_blob_by_lines(img, blob, min_area)]
 
-    boxes = [box for box in (_blob_to_box(b) for b in blobs) if box is not None]
-    return _order_boxes(boxes, h)
+    keep = KEEP_AREA_FRAC * h * w
+    boxes = [box for box in (_blob_to_box(b, keep) for b in blobs) if box is not None]
+    pad = BOX_PAD * max(H, W)
+    return _order_boxes([_full_res_box(b, scale, pad, W, H) for b in boxes], H)
+
+
+def _to_bgr8(img):
+    """An 8-bit, 3-channel BGR view of any image cv2 reads, for detection."""
+    if img.dtype != np.uint8:
+        img = cv2.convertScaleAbs(img, alpha=255.0 / max(1, np.iinfo(img.dtype).max)
+                                  if img.dtype.kind in "ui" else 255.0)
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return img
+
+
+def _full_res_box(box, scale, pad, W, H):
+    """Map a box found on the detection copy back to full resolution, grown
+    by pad on every side and clipped to the W x H page."""
+    x, y, bw, bh = box
+    x0 = max(0, int(np.floor(x / scale - pad)))
+    y0 = max(0, int(np.floor(y / scale - pad)))
+    x1 = min(W, int(np.ceil((x + bw) / scale + pad)))
+    y1 = min(H, int(np.ceil((y + bh) / scale + pad)))
+    return (x0, y0, x1 - x0, y1 - y0)
 
 
 def _order_boxes(boxes, h):
@@ -484,41 +636,81 @@ def _order_boxes(boxes, h):
 def _needs_manual(img, boxes):
     """True when the automatic split most likely failed and the page should be
     handed off to manual boxing. Catches the common failure -- touching / faded
-    photos that merge into one page-spanning blob -- and the empty result."""
+    photos that merge into one blob spanning the page edge to edge -- and the
+    empty result. One large photo with paper visible around it is fine --
+    unless a full-span straight print edge runs across it (_looks_butted)."""
     h, w = img.shape[:2]
     page = h * w
     if not boxes:
         return True
     areas = sorted((bw * bh for _, _, bw, bh in boxes), reverse=True)
-    big_w, big_h = max(boxes, key=lambda b: b[2] * b[3])[2:4]
-    if big_w >= MANUAL_SPAN * w and big_h >= MANUAL_SPAN * h:
-        return True            # one box spans most of the page -> merged/failed
+    x, y, big_w, big_h = max(boxes, key=lambda b: b[2] * b[3])
+    near = 2 * BOX_PAD * max(h, w) + 2         # padding may push a box to the edge
+    edges = (x <= near) + (y <= near) + (x + big_w >= w - near) + (y + big_h >= h - near)
+    if edges >= 3 and areas[0] >= MANUAL_DOMINANT_AREA * page:
+        return True            # a big box runs to the page edges -> merged/failed
+    if big_w >= MANUAL_SPAN * w and big_h >= MANUAL_SPAN * h \
+            and _looks_butted(img, (x, y, big_w, big_h)):
+        return True            # one photo-sized box, but really several butted
     if len(areas) >= 2 and areas[0] >= MANUAL_DOMINANT_AREA * page \
             and areas[0] >= MANUAL_DOMINANT_RATIO * areas[1]:
         return True            # one blob dwarfs the rest -> it ate its neighbours
     return False
 
 
+def _looks_butted(img, box):
+    """True if a full-span straight print edge crosses the box -- i.e. it is
+    probably several photos butted together rather than one. Only used to
+    queue a page for manual boxes, so a false alarm merely asks the user."""
+    x, y, bw, bh = box
+    crop = _to_bgr8(img[y:y + bh, x:x + bw])
+    s = min(1.0, WORK_MAX / max(bw, bh))
+    if s < 1.0:
+        crop = cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    ch, cw = crop.shape[:2]
+    mask = np.full((ch, cw), 255, np.uint8)
+    return _best_line_cut(crop, mask, MIN_AREA_FRAC * ch * cw) is not None
+
+
+def read_image(path):
+    """Read an image exactly as stored -- bit depth, alpha and grey kept, EXIF
+    orientation NOT applied -- so crops are pixel-identical to the file."""
+    return cv2.imread(path, cv2.IMREAD_UNCHANGED)
+
+
 def _write_crops(path, img, boxes, out_dir=None):
-    """Write each box as <stem>_<n>.<ext>. With out_dir, crops go there (keeping
-    the source's base name); otherwise next to the source. Returns the count."""
+    """Write each box as <stem>_<n>.<ext>, pixel-identical to the source: a
+    lossless format is kept, a lossy one (LOSSY_EXTS) becomes PNG. A crop of a
+    colour image whose channels are all equal (a grey photo, or a grey scan
+    stored as RGB) is written as one grey channel -- the same pixel values in
+    a third of the space; each crop is judged on its own. With
+    out_dir, crops go there (keeping the source's base name); otherwise next to
+    the source. Boxes are clipped to the image. Returns the count written."""
     stem, ext = os.path.splitext(path)
-    if ext.lower() not in IMAGE_EXTS:
+    if ext.lower() not in IMAGE_EXTS or ext.lower() in LOSSY_EXTS:
         ext = ".png"
     if out_dir:
         stem = os.path.join(out_dir, os.path.basename(stem))
+    params = [cv2.IMWRITE_PNG_COMPRESSION, 1] if ext.lower() == ".png" else []
+    H, W = img.shape[:2]
     count = 0
     for i, (x, y, bw, bh) in enumerate(boxes, start=1):
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(W, x + bw), min(H, y + bh)
         out = f"{stem}_{i}{ext}"
-        if cv2.imwrite(out, img[y:y + bh, x:x + bw]):
+        crop = img[y0:y1, x0:x1]
+        if crop.ndim == 3 and crop.shape[2] == 3 and \
+                (crop[..., 0] == crop[..., 1]).all() and (crop[..., 1] == crop[..., 2]).all():
+            crop = crop[..., 0]
+        if x1 > x0 and y1 > y0 and cv2.imwrite(out, crop, params):
             count += 1
-            print(f"  wrote {out}  ({bw}x{bh})")
+            print(f"  wrote {out}  ({x1 - x0}x{y1 - y0})")
         else:
             print(f"  [skip] could not write: {out}")
     return count
 
 
-def process_image(path, rectangular=False, ai=False, split_lines=False,
+def process_image(path, rectangular=False, split_lines=False,
                   manual=None, out_dir=None):
     """Extract sub-images from one image file. Returns the number written.
 
@@ -530,7 +722,7 @@ def process_image(path, rectangular=False, ai=False, split_lines=False,
         queue after the batch.
     Crops are written to out_dir if given, else next to the source.
     """
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    img = read_image(path)
     if img is None:
         print(f"  [skip] could not read image: {path}")
         return 0
@@ -542,7 +734,7 @@ def process_image(path, rectangular=False, ai=False, split_lines=False,
         print(f"  using {len(boxes)} manual box(es) from {os.path.basename(manual['path'])}")
         return _write_crops(path, img, boxes, out_dir)
 
-    boxes = find_subimages(img, rectangular=rectangular, ai=ai, split_lines=split_lines)
+    boxes = find_subimages(img, rectangular=rectangular, split_lines=split_lines)
 
     if manual is not None and _needs_manual(img, boxes):
         manual["entries"].setdefault(ap, None)
@@ -617,7 +809,7 @@ def _draw_and_crop(path, manual, draw_mod, out_dir=None, index=None, total=None)
     if not boxes:
         print("  [manual] skipped -- still needs boxes")
         return 0
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    img = read_image(path)
     boxes = _order_boxes(list(boxes), img.shape[0])
     manual["entries"][os.path.abspath(path)] = boxes
     return _write_crops(path, img, boxes, out_dir)
@@ -661,53 +853,26 @@ def iter_input_paths(path):
 
 
 def main(argv):
-    args = argv[1:]
-    rectangular = ai = False
-    for flag in ("--rectangular", "-r"):
-        if flag in args:
-            rectangular = True
-            args = [a for a in args if a != flag]
-    for flag in ("--ai", "-a"):
-        if flag in args:
-            ai = True
-            args = [a for a in args if a != flag]
-    split_lines = False
-    for flag in ("--split-lines", "-l"):
-        if flag in args:
-            split_lines = True
-            args = [a for a in args if a != flag]
+    ap = argparse.ArgumentParser(prog="uncollage.py", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 usage="%(prog)s INPUT [OUTPUT] [options]")
+    ap.add_argument("input", metavar="INPUT", help="image, folder, or text file of image paths")
+    ap.add_argument("output", metavar="OUTPUT", nargs="?",
+                    help="folder for the crops (default: next to each source)")
+    ap.add_argument("-t", "--touching", action="store_true",
+                    help="also cut photos butted together with no gap")
+    ap.add_argument("--no-draw", action="store_true",
+                    help="do not open the box editor for failed pages")
+    ap.add_argument("--manual", default=MANUAL_FILE_DEFAULT, metavar="FILE",
+                    help="manual-boxes file (default %(default)s)")
+    opt = ap.parse_args(argv[1:])
+    in_path, out_dir, manual_path, no_draw = opt.input, opt.output, opt.manual, opt.no_draw
 
-    manual_path = MANUAL_FILE_DEFAULT
-    if "--manual" in args:
-        i = args.index("--manual")
-        manual_path = args[i + 1]
-        del args[i:i + 2]
-    out_dir = None
-    for flag in ("--out", "-o"):
-        if flag in args:
-            i = args.index(flag)
-            out_dir = args[i + 1]
-            del args[i:i + 2]
-    no_draw = "--no-draw" in args
-    args = [a for a in args if a != "--no-draw"]
-
-    if len(args) != 1:
-        print(__doc__)
-        return 2
-
-    in_path = args[0]
     if not os.path.exists(in_path):
         print(f"error: path does not exist: {in_path}")
         return 1
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-
-    if ai:
-        import seam_ai
-        if not seam_ai.SeamMLP.load().ready:
-            print("error: --ai needs a trained model. Run:\n"
-                  "    python seam_ai.py train")
-            return 1
 
     manual = _load_manual(manual_path)
 
@@ -715,8 +880,8 @@ def main(argv):
     total = 0
     for img_path in iter_input_paths(in_path):
         print(f"processing {img_path}")
-        total += process_image(img_path, rectangular=rectangular, ai=ai,
-                               split_lines=split_lines, manual=manual, out_dir=out_dir)
+        total += process_image(img_path, rectangular=opt.touching,
+                               split_lines=opt.touching, manual=manual, out_dir=out_dir)
 
     # Pass 2: draw boxes for the queued failures, then crop them.
     queued = list(manual["pending"])

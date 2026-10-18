@@ -1,6 +1,26 @@
+# Never commit images (personal scans!) except the logo and the committed
+# test galleries. A scan saved in any format stays out by default.
 *.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.bmp
+*.webp
+*.gif
+*.heic
+*.heif
+*.xcf
+!Logo/**
+!tests/output/**
+!tests/output_real/**
 manual_boxes.txt
 images_to_process.txt
 __pycache__/
-# regenerable output of tests/gen_collages.py
+# regenerable test inputs (rebuild with the gen_collages*.py scripts)
 tests/collages/
+tests/collages_real/
+# downloaded real-photo pool (fetch with tests/fetch_photos.py)
+tests/photos/
+# downloaded real collages from Wikimedia Commons (fetch_real_collages.py)
+tests/real_collages/

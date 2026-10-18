@@ -1,0 +1,1 @@
+Cannot be split automatically on real photos; uncollage queues this for the manual-boxes fallback.

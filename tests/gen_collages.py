@@ -64,8 +64,11 @@ def _faint_scene(rng, h, w):
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
-# --- scenario builders (each seeds its own RNG => order-independent) ----------
-def separated():
+# --- scenario builders --------------------------------------------------------
+# Each seeds its own RNG (order-independent) and takes a `tile(rng, h, w)`
+# provider so the SAME layouts can be filled with synthetic tiles (default) or
+# real photographs (see gen_collages_real.py).
+def separated(tile=_photo):
     """4 photos with clear paper gaps -> plain mode finds 4."""
     rng = np.random.default_rng(1)
     H, W = 900, 1200
@@ -73,11 +76,11 @@ def separated():
     ph, pw, gap, m = 360, 520, 60, 40
     for ry, rx in [(0, 0), (0, 1), (1, 0), (1, 1)]:
         y, x = m + ry * (ph + gap), m + rx * (pw + gap)
-        page[y:y + ph, x:x + pw] = _photo(rng, ph, pw)
+        page[y:y + ph, x:x + pw] = tile(rng, ph, pw)
     return page
 
 
-def rotated():
+def rotated(tile=_photo):
     """3 tilted photos -> plain mode finds 3 (each cropped as upright bbox)."""
     rng = np.random.default_rng(2)
     H, W = 950, 1250
@@ -85,13 +88,13 @@ def rotated():
     specs = [(300, 400, 18, 330, 230), (300, 360, -15, 900, 260),
              (300, 430, 8, 560, 660)]
     for ph, pw, ang, cx, cy in specs:
-        tile = _photo(rng, ph, pw)
+        tile_img = tile(rng, ph, pw)
         M = cv2.getRotationMatrix2D((pw / 2, ph / 2), ang, 1.0)
         cos, sin = abs(M[0, 0]), abs(M[0, 1])
         nw, nh = int(ph * sin + pw * cos), int(ph * cos + pw * sin)
         M[0, 2] += nw / 2 - pw / 2
         M[1, 2] += nh / 2 - ph / 2
-        rot = cv2.warpAffine(tile, M, (nw, nh))
+        rot = cv2.warpAffine(tile_img, M, (nw, nh))
         # composite only the photo pixels; the rotated corners keep the paper,
         # so no black rectangle is pasted onto the background.
         mask = cv2.warpAffine(np.full((ph, pw), 255, np.uint8), M, (nw, nh)) > 127
@@ -104,58 +107,111 @@ def rotated():
     return page
 
 
-def touching():
-    """2 photos butted with a dark shadow seam -> needs -r to split into 2."""
+def touching(tile=_photo, seam_color=(40, 38, 36), seam_w=6):
+    """2 photos butted with a dark shadow seam -> needs -r to split into 2.
+
+    `seam_color`/`seam_w` tune the separator: the default light-ish shadow suits
+    synthetic tiles; real photos need a near-black seam (their own content can be
+    as dark as a faint shadow), see gen_collages_real.py.
+    """
     rng = np.random.default_rng(3)
     H, W = 800, 1200
     page = _paper_bg(rng, H, W)
     ph, pw, m = 560, 540, 40
-    page[m:m + ph, m:m + pw] = _photo(rng, ph, pw)
+    page[m:m + ph, m:m + pw] = tile(rng, ph, pw)
     x1 = m + pw
-    page[m:m + ph, x1:x1 + 6] = (40, 38, 36)            # shadow ridge
-    page[m:m + ph, x1 + 6:x1 + 6 + pw] = _photo(rng, ph, pw)
+    page[m:m + ph, x1:x1 + seam_w] = seam_color         # shadow ridge / paper gap
+    page[m:m + ph, x1 + seam_w:x1 + seam_w + pw] = tile(rng, ph, pw)
     return page
 
 
-def grid():
-    """2x3 grid of touching photos, thin dark seams -> needs -r to split into 6."""
+def grid(tile=_photo, seam_color=(38, 36, 34), seam=6, margin=30):
+    """2x3 grid of photos with thin seams.
+
+    With a dark `seam_color` the photos are butted and need -r to split into 6;
+    with a paper-coloured seam they have visible gaps and split in plain mode.
+    """
     rng = np.random.default_rng(4)
     H, W = 900, 1300
     page = _paper_bg(rng, H, W)
-    rows, cols, m, seam = 2, 3, 30, 6
+    rows, cols, m = 2, 3, margin
     ph = (H - 2 * m - (rows - 1) * seam) // rows
     pw = (W - 2 * m - (cols - 1) * seam) // cols
     for r in range(rows):
         for c in range(cols):
             y, x = m + r * (ph + seam), m + c * (pw + seam)
-            page[y:y + ph, x:x + pw] = _photo(rng, ph, pw)
+            page[y:y + ph, x:x + pw] = tile(rng, ph, pw)
     for r in range(1, rows):
         y = m + r * ph + (r - 1) * seam
-        page[y:y + seam, m:W - m] = (38, 36, 34)
+        page[y:y + seam, m:W - m] = seam_color
     for c in range(1, cols):
         x = m + c * pw + (c - 1) * seam
-        page[m:H - m, x:x + seam] = (38, 36, 34)
+        page[m:H - m, x:x + seam] = seam_color
     return page
 
 
-def composite():
+def composite(tile=_photo):
     """2 distinct photos butted with NO gap/seam -> needs -l to split into 2."""
     rng = np.random.default_rng(5)
     H, W = 900, 700
     page = _paper_bg(rng, H, W)
     ph, pw, m = 820, 620, 40
-    tile = np.vstack([_photo(rng, ph // 2, pw), _photo(rng, ph - ph // 2, pw)])
-    page[m:m + ph, m:m + pw] = tile
+    stack = np.vstack([tile(rng, ph // 2, pw), tile(rng, ph - ph // 2, pw)])
+    page[m:m + ph, m:m + pw] = stack
     return page
 
 
-def hard():
+def hard(scene=_faint_scene):
     """A faded borderless photo whose tone ~ paper -> queued for the manual fallback."""
     rng = np.random.default_rng(6)
     H, W = 700, 700
     page = _paper_bg(rng, H, W)
     ph, pw, m = 600, 600, 50
-    page[m:m + ph, m:m + pw] = _faint_scene(rng, ph, pw)
+    page[m:m + ph, m:m + pw] = scene(rng, ph, pw)
+    return page
+
+
+def tinted(tile=_photo):
+    """4 photos on coloured paper with a strong lighting gradient (bright left,
+    ~70 levels darker right) -> plain mode follows the gradient, finds 4."""
+    rng = np.random.default_rng(7)
+    H, W = 900, 1200
+    page = np.empty((H, W, 3), np.float32)
+    page[:] = (200, 225, 150)                               # mint/teal paper (BGR)
+    page *= np.linspace(1.0, 0.7, W)[None, :, None]         # scanner falloff
+    page += rng.normal(0, 3, (H, W, 3))
+    page = np.clip(page, 0, 255).astype(np.uint8)
+    ph, pw, gap, m = 360, 520, 60, 40
+    for ry, rx in [(0, 0), (0, 1), (1, 0), (1, 1)]:
+        y, x = m + ry * (ph + gap), m + rx * (pw + gap)
+        page[y:y + ph, x:x + pw] = tile(rng, ph, pw)
+    return page
+
+
+def dark(tile=_photo):
+    """3 large, mostly near-black photos (more black than paper on the page) and
+    a dark scanner-lid strip along the top -> plain mode still takes the paper,
+    not black, as background and finds 3."""
+    rng = np.random.default_rng(8)
+    H, W = 1000, 800
+    page = _paper_bg(rng, H, W)
+    page[:6] = 15                                            # scanner-lid edge
+    for y, x, ph, pw in [(40, 40, 440, 340), (40, 420, 440, 340), (520, 40, 440, 720)]:
+        t = (tile(rng, ph, pw).astype(np.float32) * 0.15 + 5).astype(np.uint8)
+        page[y:y + ph, x:x + pw] = t
+    return page
+
+
+def corner(tile=_photo):
+    """2 photos meeting corner to corner, the narrow gap between them filled by
+    the grey shadow thick prints cast -> one blob in the mask; plain mode cuts
+    it into 2."""
+    rng = np.random.default_rng(9)
+    H, W = 900, 900
+    page = _paper_bg(rng, H, W)
+    cv2.rectangle(page, (425, 415), (465, 455), (175, 175, 175), -1)  # shadow
+    page[40:430, 40:440] = tile(rng, 390, 400)
+    page[440:860, 450:860] = tile(rng, 420, 410)
     return page
 
 
@@ -167,6 +223,9 @@ SCENARIOS = [
     ("grid", grid, {"rectangular": True}, 6, False),
     ("composite", composite, {"split_lines": True}, 2, False),
     ("hard", hard, {}, 0, True),
+    ("tinted", tinted, {}, 4, False),
+    ("dark", dark, {}, 3, False),
+    ("corner", corner, {}, 2, False),
 ]
 
 

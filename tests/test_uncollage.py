@@ -78,6 +78,71 @@ def test_process_image_writes_and_queues(tmp_path=None):
             assert len(os.listdir(crops)) == expected
 
 
+def _crops_pixel_identical():
+    """A JPEG source is cropped to PNGs whose pixels equal the decoded source."""
+    import cv2
+    import numpy as np
+    out = tempfile.mkdtemp()
+    src = os.path.join(out, "page.jpg")
+    cv2.imwrite(src, gen_collages.separated())
+    img = uncollage.read_image(src)
+    boxes = uncollage.find_subimages(img)
+    if uncollage.process_image(src, out_dir=out) != len(boxes):
+        return False
+    for i, (x, y, w, h) in enumerate(boxes, start=1):
+        crop = cv2.imread(os.path.join(out, f"page_{i}.png"), cv2.IMREAD_UNCHANGED)
+        if crop is None or not np.array_equal(crop, img[y:y + h, x:x + w]):
+            return False
+    return True
+
+
+def _grey_crops_one_channel():
+    """On a colour page, crops of grey photos are written as one grey channel
+    (same pixel values) and crops of colour photos stay colour."""
+    import cv2
+    import numpy as np
+    page = gen_collages.separated()
+    page[:, :600] = cv2.cvtColor(cv2.cvtColor(page[:, :600], cv2.COLOR_BGR2GRAY),
+                                 cv2.COLOR_GRAY2BGR)       # left photos -> grey
+    out = tempfile.mkdtemp()
+    src = os.path.join(out, "mixed.png")
+    cv2.imwrite(src, page)
+    boxes = uncollage.find_subimages(page)
+    uncollage.process_image(src, out_dir=out)
+    for i, (x, y, w, h) in enumerate(boxes, start=1):
+        raw = cv2.imread(os.path.join(out, f"mixed_{i}.png"), cv2.IMREAD_UNCHANGED)
+        grey = x + w <= 600
+        if (raw.ndim == 2) != grey:
+            return False
+        if not np.array_equal(cv2.imread(os.path.join(out, f"mixed_{i}.png")),
+                              page[y:y + h, x:x + w]):
+            return False
+    return True
+
+
+def _boxes_contain_photos():
+    """Every crop box fully contains its photo (padded, never clipped)."""
+    ph, pw, gap, m = 360, 520, 60, 40              # separated() layout
+    truth = [(m + c * (pw + gap), m + r * (ph + gap), pw, ph)
+             for r in (0, 1) for c in (0, 1)]
+    boxes = uncollage.find_subimages(gen_collages.separated())
+    return len(boxes) == 4 and all(
+        bx <= tx and by <= ty and bx + bw >= tx + tw and by + bh >= ty + th
+        for (bx, by, bw, bh), (tx, ty, tw, th) in zip(boxes, truth))
+
+
+def test_crops_pixel_identical():
+    assert _crops_pixel_identical()
+
+
+def test_grey_crops_one_channel():
+    assert _grey_crops_one_channel()
+
+
+def test_boxes_contain_photos():
+    assert _boxes_contain_photos()
+
+
 # --- standalone runner --------------------------------------------------------
 def _main():
     print(f"uncollage regression suite  (cv2 {getattr(__import__('cv2'), '__version__', '?')})\n")
@@ -101,6 +166,9 @@ def _main():
 
     check("touching w/o -r", _count(gen_collages.touching(), {}) == 1)
     check("separated w/ -l", _count(gen_collages.separated(), {"split_lines": True}) == 4)
+    check("pixel-identical", _crops_pixel_identical())
+    check("box holds photo", _boxes_contain_photos())
+    check("grey crop 1-ch", _grey_crops_one_channel())
 
     w = max(len(r[0]) for r in rows)
     print(f"{'scenario'.ljust(w)}  {'flags':<14} {'want':<8} {'got':<8} result")

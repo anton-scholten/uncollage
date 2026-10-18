@@ -41,9 +41,10 @@ import cv2
 import numpy as np
 import torch
 
+import uncollage
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CKPT = os.path.join(HERE, "sam_vit_b.pth")
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 # --- selection tunables (automatic mode) -------------------------------------
 MIN_AREA_FRAC = 0.015    # a print is at least this fraction of the page
@@ -206,24 +207,18 @@ def _read_boxes(path):
 
 
 def process_image(path, checkpoint=DEFAULT_CKPT, boxes_file=None, debug=False):
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    if img is None:
+    raw = uncollage.read_image(path)     # crops stay pixel-identical to the file
+    if raw is None:
         print(f"  [skip] could not read image: {path}")
         return 0
+    img = uncollage._to_bgr8(raw)
     if boxes_file:
         boxes = find_subimages_boxes(img, _read_boxes(boxes_file), checkpoint)
     else:
         boxes = find_subimages_auto(img, checkpoint)
 
-    stem, ext = os.path.splitext(path)
-    if ext.lower() not in IMAGE_EXTS:
-        ext = ".png"
-    count = 0
-    for i, (x, y, bw, bh) in enumerate(boxes, start=1):
-        out = f"{stem}_{i}{ext}"
-        if cv2.imwrite(out, img[y:y + bh, x:x + bw]):
-            count += 1
-            print(f"  wrote {out}  ({bw}x{bh})")
+    stem = os.path.splitext(path)[0]
+    count = uncollage._write_crops(path, raw, boxes)
     if debug:
         vis = img.copy()
         for x, y, bw, bh in boxes:
