@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-draw_boxes.py -- draw a rough rectangle around each photo in a scanned collage
-and save them as a boxes file for `sam_uncollage.py --boxes`.
-
-For pages whose photos are faded / borderless (invisible edges on shadowed
-paper), no automatic method can find them -- you indicate each one here with a
-quick drag, and SAM tightens the ones it can while keeping your rectangle for
-the rest.
+draw_boxes.py -- box editor: draw or adjust one rectangle per photo on a
+scanned page, for pages uncollage.py cannot split automatically (faded,
+borderless photos whose edges are invisible in the scan).
 
 Usage:
-    python draw_boxes.py IMG [-o boxes.txt] [--run]     # single image -> boxes file
+    python draw_boxes.py IMG [OUTPUT]                   # adjust boxes, crop the image
     python draw_boxes.py manual_boxes.txt [--redo]      # fill uncollage.py's list
+
+  With an image, the boxes you save are cropped right away, pixel-identical,
+  exactly as uncollage.py crops (into OUTPUT, or next to the image; existing
+  crops of that image are replaced).
 
   In list mode the argument is uncollage.py's manual-boxes file (one image path
   per line). Each image lacking boxes is opened in turn; the coordinates you
@@ -40,8 +40,7 @@ Overlapping boxes are supported: because only a box's edge (or corner) grabs it,
 a drag that starts inside a box makes a new box instead of moving the old one,
 so overlapping sub-images can each get their own box.
 
-Boxes are written one "x y w h" per line in SOURCE-image pixels. With --run,
-sam_uncollage.py is invoked on the image with the saved boxes afterwards.
+Box coordinates are "x y w h" in SOURCE-image pixels.
 
 The window is plain Tk (Python's standard tkinter), so it uses the OS's fonts
 and needs no GUI build of OpenCV.
@@ -50,7 +49,6 @@ Requires: opencv-python (cv2), numpy, tkinter. Optional: Pillow (faster redraws)
 """
 
 import os
-import subprocess
 import sys
 import tkinter as tk
 
@@ -549,14 +547,9 @@ def run_manual_file(list_path, redo=False):
 
 def main(argv):
     args = argv[1:]
-    run = "--run" in args
-    args = [a for a in args if a != "--run"]
     redo = "--redo" in args
     args = [a for a in args if a != "--redo"]
-    out = "boxes.txt"
-    if "-o" in args:
-        i = args.index("-o"); out = args[i + 1]; del args[i:i + 2]
-    if len(args) != 1:
+    if len(args) not in (1, 2):
         print(__doc__)
         return 2
     target = args[0]
@@ -564,24 +557,21 @@ def main(argv):
         # a list file (uncollage.py's manual-boxes file), not a single image
         return run_manual_file(target, redo=redo)
 
-    image_path = target
-    boxes = draw(image_path, initial=_detected(image_path), draft_file=out + ".draft")
+    # one image: adjust the boxes, then crop it exactly as uncollage.py would
+    import uncollage
+    image_path, out_dir = target, (args[1] if len(args) == 2 else None)
+    boxes = draw(image_path, initial=_detected(image_path),
+                 draft_file=uncollage.MANUAL_FILE_DEFAULT + ".draft")
     if not boxes:
         print("no boxes saved.")
         return 1
-    with open(out, "w") as f:
-        f.write("# x y w h  (one rough rectangle per photo, source pixels)\n")
-        for x, y, bw, bh in boxes:
-            f.write(f"{x} {y} {bw} {bh}\n")
-    print(f"wrote {len(boxes)} boxes to {out}")
-    if run:
-        here = os.path.dirname(os.path.abspath(__file__))
-        cmd = [sys.executable, os.path.join(here, "sam_uncollage.py"),
-               image_path, "--boxes", out]
-        print("running:", " ".join(cmd))
-        return subprocess.call(cmd)
-    print(f"next: python sam_uncollage.py {image_path} --boxes {out}")
-    return 0
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    img = uncollage.read_image(image_path)
+    boxes = uncollage._order_boxes(boxes)
+    n = uncollage._write_crops(image_path, img, boxes, out_dir, overwrite=True)
+    print(f"wrote {n} crop(s)")
+    return 0 if n == len(boxes) else 1
 
 
 if __name__ == "__main__":

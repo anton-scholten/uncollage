@@ -14,12 +14,10 @@ is cropped as an upright rectangle with a small margin, so nothing is cut off
 |---|---|
 | `uncollage.py` | Automatic splitting, with a box editor for pages it can't split. |
 | `draw_boxes.py` | Box editor; also usable on its own. |
-| `sam_uncollage.py` | Optional splitting with Meta's Segment Anything model. |
 
-**Requirements:** `opencv-python`, `numpy`, and `tkinter` for the editor
-(`sudo apt install python3-tk` if missing; `Pillow` makes it faster but is
-optional). `sam_uncollage.py` also needs `torch`, `torchvision`,
-`segment-anything` and the ViT-B checkpoint saved as `sam_vit_b.pth`.
+**Requirements:** `pip install -r requirements.txt` (`opencv-python`, `numpy`;
+`Pillow` is optional and makes the editor faster), plus `tkinter` for the
+editor (`sudo apt install python3-tk` if missing).
 
 ---
 
@@ -87,7 +85,7 @@ python draw_boxes.py manual_boxes.txt     # then re-run the uncollage command
 ## draw_boxes.py
 
 ```
-python draw_boxes.py IMG [-o boxes.txt] [--run]   # one image -> boxes file (--run: crop with SAM)
+python draw_boxes.py IMG [OUTPUT]                 # adjust boxes on one image and crop it
 python draw_boxes.py manual_boxes.txt [--redo]    # draw the pages uncollage.py queued
 ```
 
@@ -104,17 +102,6 @@ so a box around the whole page can start outside it. It starts with the boxes
 automatic detection finds (one around the whole image if none). Every edit is
 saved at once to `<boxes file>.draft`, so an interrupted session (Ctrl+C, closed
 window) loses nothing and is offered again next time; Save or Cancel clears it.
-
----
-
-## sam_uncollage.py (optional)
-
-```
-python sam_uncollage.py IMG [--debug]                     # automatic masks
-python sam_uncollage.py IMG --boxes boxes.txt [--debug]   # refine rough boxes (most reliable)
-```
-
-`--checkpoint PATH` sets the model file; `--debug` writes `<stem>.sam_debug.png`.
 
 ---
 

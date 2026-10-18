@@ -1,0 +1,3 @@
+opencv-python
+numpy
+Pillow   # optional: faster redraws in the box editor
